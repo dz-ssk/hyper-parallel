@@ -48,19 +48,23 @@ from hyper_parallel.models.replacement import (
 from .config import load_reference, make_hf_config
 from .parallel import plan_overrides
 from .weights import convert_reference
+from .model import DeepseekV32SFTForCausalLM
+from .adapters import apply_precision_adapters
 
 
-def inspect_structure(document: dict[str, Any], arrays: dict[str, np.ndarray]) -> tuple[nn.Module, dict]:
+def inspect_structure(document: dict[str, Any], arrays: dict[str, np.ndarray],
+                      sft_forward: bool = False) -> tuple[nn.Module, dict]:
     """Check exact state coverage using real HF modules on meta then CPU.
 
     Args:
         document: Validated reference configuration.
         arrays: Global HF-layout arrays reconstructed from reference rank shards.
+        sft_forward: Enable the isolated reference first-loss adapters after loading.
     """
     cfg = make_hf_config(document)
     reference = document["model"]["model_config"]
     with torch.device("meta"):
-        model = DeepseekV32ForCausalLM(cfg)
+        model = (DeepseekV32SFTForCausalLM if sft_forward else DeepseekV32ForCausalLM)(cfg)
         model.mtp = nn.Module()
         model.mtp.layers = nn.ModuleList()
         mtp_config = copy.deepcopy(cfg)
@@ -107,6 +111,12 @@ def inspect_structure(document: dict[str, Any], arrays: dict[str, np.ndarray]) -
             raise ValueError(f"Loaded tensor differs: {name}")
     if model.model.embed_tokens.weight is model.lm_head.weight:
         raise ValueError("Reference embedding and LM head must not be tied")
+    if sft_forward:
+        model = apply_precision_adapters(model)
+        model.reference_config = reference
+        for module in model.modules():
+            if hasattr(module, "experts") and hasattr(module, "shared_experts"):
+                module.reference_config = reference
     return model, {"model_class": type(model).__name__, "loaded_state_tensors": len(fused),
                    "replacement_count": len(replacement_plan.targets), "transform_count": len(transforms),
                    "logical_optimizer_groups": logical_groups, "all_loaded_values_exact": True}
