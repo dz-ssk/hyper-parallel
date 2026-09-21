@@ -12,13 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Eight-rank Hyper apply/MLA probe; this is not a reference SFT training entry.
+"""Eight-rank layout/MLA probe and optional reference SFT first-loss evaluator.
 
-The stock DeepSeek EP factory is used only to check apply-time compatibility.
-No MoE forward is called, and reference routing/loss equivalence is not claimed.
+The first-loss mode uses the reference EP factory and runs the complete forward.
+This entry does not execute backward or optimizer updates. Archived-model
+tensor diagnostics are optional and excluded from the normal evaluation.
 """
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -38,18 +40,25 @@ from .audit import inspect_structure
 from .config import load_reference
 from .parallel import plan_overrides
 from .weights import convert_reference
+from .ep import deepseek_v32_sft_ep_compute
+from .diagnostics import attach_reference_comparison
 
 
 def main() -> None:
-    """Apply actual eight-rank meshes and optionally execute one 256K MLA layer."""
+    """Apply eight-rank meshes and optionally evaluate MLA or the 256K first loss."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--reference-yaml", required=True)
     parser.add_argument("--reference-weights", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--mla-forward", action="store_true")
+    parser.add_argument("--first-loss-data")
+    parser.add_argument("--reference-code")
+    parser.add_argument("--reference-model-class", default="ReferenceSFTModel")
     args = parser.parse_args()
     rank = int(os.environ["LOCAL_RANK"])
     torch_npu.npu.set_device(rank)
+    torch_npu.npu.set_compile_mode(jit_compile=False)
+    torch.use_deterministic_algorithms(True)
     dist.init_process_group("hccl")
     try:
         if dist.get_world_size() != 8:
@@ -57,7 +66,7 @@ def main() -> None:
         document = load_reference(args.reference_yaml)
         config = document["model"]["model_config"]
         arrays, _, _ = convert_reference(args.reference_weights, document)
-        model, report = inspect_structure(document, arrays)
+        model, report = inspect_structure(document, arrays, sft_forward=args.first_loss_data is not None)
         global_parameters = {name: value.detach().clone() for name, value in model.named_parameters()}
         device = torch.device(f"npu:{rank}")
         # Nonpersistent meta RoPE buffers are unused: this probe supplies frequencies explicitly.
@@ -73,7 +82,8 @@ def main() -> None:
         for name, module in model.named_modules():
             if hasattr(module, "experts") and hasattr(module, "shared_experts"):
                 overrides[name] = ModuleShardingSpec(
-                    local_compute_fn=deepseekv3_ep_compute_fn, region_dispatch=False)
+                    local_compute_fn=deepseek_v32_sft_ep_compute if args.first_loss_data else deepseekv3_ep_compute_fn,
+                    region_dispatch=False)
         plan = ShardingPlanner(plan_overrides=overrides).plan(
             model, mesh.device_mesh, tp_size=8, ep_size=8, cp_size=1,
             sequence_parallel=True, loss_parallel=True,
@@ -110,6 +120,24 @@ def main() -> None:
             torch_npu.npu.synchronize()
             report.update(stage="mla_forward", output_shape=list(result.shape),
                           output_finite=bool(torch.isfinite(result).all().item()))
+        if args.first_loss_data:
+            with np.load(args.first_loss_data, allow_pickle=False) as archive:
+                tokens = torch.from_numpy(archive["input_ids"][0].astype(np.int64)).unsqueeze(0).to(device)
+                labels = torch.from_numpy(archive["labels"][0].astype(np.int64)).unsqueeze(0).to(device)
+                loss_mask = torch.from_numpy(archive["loss_mask"][0].astype(np.float32)).unsqueeze(0).to(device)
+            handles = []
+            if args.reference_code:
+                handles, comparisons, reference_losses = attach_reference_comparison(
+                    model, document, args.reference_code, args.reference_yaml, args.reference_weights,
+                    tokens, labels, loss_mask, args.reference_model_class)
+                report.update(tensor_comparisons=comparisons, reference_losses=reference_losses)
+            with torch.no_grad(), torch.autocast("npu", dtype=torch.bfloat16):
+                losses = model(tokens, labels, loss_mask)
+            for handle in handles:
+                handle.remove()
+            torch_npu.npu.synchronize()
+            report.update(stage="first_loss", losses={name: value.item() for name, value in losses.items()},
+                          dataset_sha256=hashlib.sha256(Path(args.first_loss_data).read_bytes()).hexdigest())
         destination = Path(args.output)
         destination.mkdir(parents=True, exist_ok=True)
         (destination / f"rank_{rank}.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
