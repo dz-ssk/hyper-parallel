@@ -38,7 +38,7 @@ def plan_overrides(mtp_layers: int) -> dict[str, ModuleShardingSpec]:
         ),
         "*.mlp.shared_experts": ModuleShardingSpec(
             params={f"{name}.weight": {TP: Replicate()} for name in ("gate_proj", "up_proj", "down_proj")},
-            in_src={"hidden_states": {TP: Shard(1)}}, in_dst={"hidden_states": {TP: Shard(1)}},
+            in_src={"x": {TP: Shard(1)}}, in_dst={"x": {TP: Shard(1)}},
             out_src={TP: Shard(1)}, out_dst={TP: Shard(1)},
         ),
     }
