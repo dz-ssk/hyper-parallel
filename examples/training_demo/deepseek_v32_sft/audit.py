@@ -50,6 +50,7 @@ from .parallel import plan_overrides
 from .weights import convert_reference
 from .model import DeepseekV32SFTForCausalLM
 from .adapters import apply_precision_adapters
+from .attention import DeepseekV32SFTMLAAttention
 
 
 def inspect_structure(document: dict[str, Any], arrays: dict[str, np.ndarray],
@@ -79,7 +80,8 @@ def inspect_structure(document: dict[str, Any], arrays: dict[str, np.ndarray],
             model.mtp.layers.append(layer)
         spec = ModuleReplacementSpec(
             match=("model.layers.*.self_attn", "mtp.layers.*.transformer_layer.self_attn"),
-            factory=MLAAttention, module_type=DeepseekV32Attention, exact_type=True,
+            factory=DeepseekV32SFTMLAAttention if sft_forward else MLAAttention,
+            module_type=DeepseekV32Attention, exact_type=True,
         )
         replacement_plan = compile_module_replacements(model, [spec])
         model, transforms = apply_module_replacements(model, replacement_plan, weights_mapping=[])
