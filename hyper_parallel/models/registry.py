@@ -117,6 +117,7 @@ _FAMILY_ALIASES: Dict[str, str] = {}
 # (Qwen3.5 text reuses the Qwen3.5 family adapter).
 _FAMILY_DIR_ALIASES = {
     "deepseekv2": "deepseek_v3",
+    "deepseekv32sft": "deepseek_v3",
     "qwen35text": "qwen3_5",
 }
 
@@ -164,7 +165,11 @@ def _discover_family_providers() -> Dict[str, str]:
 
 
 def register_model_adapter(spec: ModelAdapterSpec) -> None:
-    """Register one family's adapter spec (idempotent; conflicts fail fast)."""
+    """Register one family's adapter spec (idempotent; conflicts fail fast).
+
+    Args:
+        spec: Family adapter registration.
+    """
     existing = MODEL_ADAPTER_REGISTRY.get(spec.model_type)
     if existing is not None and existing != spec:
         raise ValueError(
@@ -185,6 +190,9 @@ def get_model_adapter(model_type: str) -> Optional[ModelAdapterSpec]:
     Accepts any spelling — model_type (``deepseek_v3``), HF architecture
     (``DeepseekV3ForCausalLM``) or the canonical arch name used by the
     planner (``deepseekv3``).
+
+    Args:
+        model_type: Family identity or architecture name.
     """
     spec = MODEL_ADAPTER_REGISTRY.get(model_type)
     if spec is None:

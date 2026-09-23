@@ -19,11 +19,13 @@ Conversion providers remain lazy so registry discovery does not import model
 implementations or backend dependencies.
 """
 
+from __future__ import annotations
+
 from hyper_parallel.models.adapter_spec import ModelAdapterSpec
 from hyper_parallel.models.deepseek_v3.adapter.policies.sharding import (
     build_parameter_sharding_rules,
 )
-from hyper_parallel.models.registry import register_model_adapter
+from hyper_parallel.models.registry import register_model_adapter, register_custom_model
 
 
 def _load_replacements():
@@ -51,3 +53,15 @@ DEEPSEEK_V2_ADAPTER_SPEC = ModelAdapterSpec(
     sharding_rules=build_parameter_sharding_rules,
 )
 register_model_adapter(DEEPSEEK_V2_ADAPTER_SPEC)
+
+
+DEEPSEEK_V32_SFT_ADAPTER_SPEC = ModelAdapterSpec(
+    architecture="DeepseekV32SFTForCausalLM",
+    model_type="deepseek_v32_sft",
+    sharding_rules=build_parameter_sharding_rules,
+)
+register_model_adapter(DEEPSEEK_V32_SFT_ADAPTER_SPEC)
+register_custom_model(
+    "DeepseekV32SFTForCausalLM", "hyper_parallel.models.deepseek_v3.modeling_deepseek_v32_sft",
+    "DeepseekV32SFTForCausalLM",
+)
