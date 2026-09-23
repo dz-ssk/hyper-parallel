@@ -17,6 +17,8 @@
 # This adapter uses the Torch/HF runtime, like the existing model and Trainer modules.
 # pylint: disable=forbidden-backend-import
 
+from __future__ import annotations
+
 from dataclasses import replace
 from fnmatch import fnmatchcase
 from pathlib import Path
@@ -33,19 +35,19 @@ from hyper_parallel.models._transformers.model_builder import (
     apply_model_infrastructure,
     instantiate_infrastructure,
 )
-from hyper_parallel.models.deepseek_v3.configuration import load_reference, make_hf_config
-from hyper_parallel.models.deepseek_v3.modeling_deepseek_v32_sft import (
-    DeepseekV32SFTForCausalLM,
+from hyper_parallel.models.jt_deepseek_v3.configuration import load_reference, make_hf_config
+from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import (
+    JTDeepseekV3ForCausalLM,
 )
 from hyper_parallel.models.replacement import _apply_module_replacement_actions
-from hyper_parallel.models.deepseek_v3.adapter.distributed.sft_expert_parallel import (
-    deepseek_v32_sft_ep_compute,
+from hyper_parallel.models.jt_deepseek_v3.adapter.distributed.jt_expert_parallel import (
+    jt_deepseek_v3_ep_compute,
 )
-from hyper_parallel.models.deepseek_v3.adapter.conversion.checkpoint_mapping import convert_reference
+from hyper_parallel.models.jt_deepseek_v3.adapter.conversion.checkpoint_mapping import convert_reference
 
 
 def _reference_moe_fqns(reference: dict[str, Any]) -> tuple[str, ...]:
-    """Return the PR946 routed-MoE parents, excluding dense trunk layers."""
+    """Return the configured routed-MoE parents, excluding dense trunk layers."""
     trunk = tuple(
         f"model.layers.{index}.mlp"
         for index in range(reference["first_k_dense_replace"], reference["num_hidden_layers"])
@@ -67,7 +69,7 @@ def _has_explicit_ep_override(overrides: dict[str, Any], fqn: str) -> bool:
 
 
 def _with_reference_ep_overrides(distributed_setup: Any, reference: dict[str, Any]) -> Any:
-    """Add only missing PR946 MoE EP factories as explicit model FQNs."""
+    """Add only missing configured MoE EP factories as explicit model FQNs."""
     overrides = dict(getattr(distributed_setup, "plan_overrides", None) or {})
     for fqn in _reference_moe_fqns(reference):
         if _has_explicit_ep_override(overrides, fqn):
@@ -75,7 +77,7 @@ def _with_reference_ep_overrides(distributed_setup: Any, reference: dict[str, An
         if fqn in overrides:
             overrides[fqn] = replace(
                 overrides[fqn],
-                local_compute_fn=deepseek_v32_sft_ep_compute,
+                local_compute_fn=jt_deepseek_v3_ep_compute,
                 region_dispatch=(
                     False if overrides[fqn].region_dispatch is None
                     else overrides[fqn].region_dispatch
@@ -83,42 +85,14 @@ def _with_reference_ep_overrides(distributed_setup: Any, reference: dict[str, An
             )
             continue
         overrides[fqn] = ModuleShardingSpec(
-            local_compute_fn=deepseek_v32_sft_ep_compute,
+            local_compute_fn=jt_deepseek_v3_ep_compute,
             region_dispatch=False,
         )
     return replace(distributed_setup, plan_overrides=overrides)
 
 
-def build_sft_model(*, reference_yaml: str | Path, reference_weights: str | Path,
-                    distributed_setup: Any, **infrastructure_options: Any) -> PreTrainedModel:
-    """Build PR946 reference state before applying Hyper's parallel infrastructure."""
-    if infrastructure_options.get("model_init_dtype") not in (None, "float32"):
-        raise ValueError("SFT precision requires FP32 master parameters")
-    infrastructure_options["model_init_dtype"] = "float32"
-
-    document = load_reference(reference_yaml)
-    reference = document["model"]["model_config"]
-    arrays, _, conversion = convert_reference(reference_weights, document)
-    setup = _with_reference_ep_overrides(distributed_setup, reference)
-    mesh = setup.mesh_context
-    if (mesh.tp_size, mesh.ep_size, mesh.cp_size, mesh.dp_size, mesh.pp_size) != (8, 8, 1, 1, 1):
-        raise ValueError("SFT recipe requires TP8/EP8 and DP/CP/PP1")
-    if not mesh.sequence_parallel or not mesh.loss_parallel:
-        raise ValueError("SFT recipe requires sequence_parallel and loss_parallel")
-
-    config = make_hf_config(document)
-    with torch.device("meta"):
-        model = DeepseekV32SFTForCausalLM(config)
-        model, _ = _apply_module_replacement_actions(
-            model,
-            getattr(setup, "module_replacements", None),
-            weights_mapping=get_model_conversion_mapping(model),
-            context=_build_replacement_context(setup, None),
-        )
-    model.to_empty(device="cpu")
-    # Rotary buffers are nonpersistent; restore their deterministic reference state after to_empty().
-    model.model.rotary_emb = type(model.model.rotary_emb)(config)
-
+def _load_reference_state(model: PreTrainedModel, arrays: dict[str, np.ndarray]) -> tuple[dict, list]:
+    """Fuse only replaced MLA projections and verify complete lossless loading."""
     logical_groups = []
     for target in model.state_dict():
         suffix = "linear_qkv.weight"
@@ -159,7 +133,48 @@ def build_sft_model(*, reference_yaml: str | Path, reference_weights: str | Path
         if value.detach().numpy().tobytes() != arrays[name].tobytes():
             raise ValueError(f"Loaded tensor differs: {name}")
     if model.model.embed_tokens.weight is model.lm_head.weight:
-        raise ValueError("SFT embedding and LM head must not be tied")
+        raise ValueError("JT embedding and LM head must not be tied")
+
+    return expected, logical_groups
+
+
+def build_jt_model(*, reference_yaml: str | Path, reference_weights: str | Path,
+                    distributed_setup: Any, **infrastructure_options: Any) -> PreTrainedModel:
+    """Load the complete model before applying Hyper's parallel infrastructure.
+
+    Args:
+        reference_yaml: Validated reference configuration file.
+        reference_weights: Directory of exported initial parameter arrays.
+        distributed_setup: Resolved mesh, replacements and sharding declarations.
+    """
+    if infrastructure_options.get("model_init_dtype") not in (None, "float32"):
+        raise ValueError("JT precision requires FP32 master parameters")
+    infrastructure_options["model_init_dtype"] = "float32"
+
+    document = load_reference(reference_yaml)
+    reference = document["model"]["model_config"]
+    arrays, _, conversion = convert_reference(reference_weights, document)
+    setup = _with_reference_ep_overrides(distributed_setup, reference)
+    mesh = setup.mesh_context
+    if (mesh.tp_size, mesh.ep_size, mesh.cp_size, mesh.dp_size, mesh.pp_size) != (8, 8, 1, 1, 1):
+        raise ValueError("JT recipe requires TP8/EP8 and DP/CP/PP1")
+    if not mesh.sequence_parallel or not mesh.loss_parallel:
+        raise ValueError("JT recipe requires sequence_parallel and loss_parallel")
+
+    config = make_hf_config(document)
+    with torch.device("meta"):
+        model = JTDeepseekV3ForCausalLM(config)
+        model, _ = _apply_module_replacement_actions(
+            model,
+            getattr(setup, "module_replacements", None),
+            weights_mapping=get_model_conversion_mapping(model),
+            context=_build_replacement_context(setup, None),
+        )
+    model.to_empty(device="cpu")
+    # Rotary buffers are nonpersistent; restore their deterministic reference state after to_empty().
+    model.model.rotary_emb = type(model.model.rotary_emb)(config)
+
+    expected, logical_groups = _load_reference_state(model, arrays)
 
     framework_setup = replace(setup, module_replacements=())
 
@@ -168,6 +183,7 @@ def build_sft_model(*, reference_yaml: str | Path, reference_weights: str | Path
     device = torch.device(mesh.device_mesh.device_type, torch.distributed.get_rank() % mesh.tp_size)
     model.to(device)
     model.loss_group = mesh.device_mesh["tp"].get_group()
+    global_shapes = {name: tuple(value.shape) for name, value in model.named_parameters()}
     model = apply_model_infrastructure(
         model,
         mesh=mesh,
@@ -178,6 +194,10 @@ def build_sft_model(*, reference_yaml: str | Path, reference_weights: str | Path
         is_meta_device=False,
         is_hf_model=True,
         **infrastructure_options,
+    )
+    model.jt_document = document
+    model.jt_replicated_names = tuple(
+        name for name, value in model.named_parameters() if tuple(value.shape) == global_shapes[name]
     )
     model.build_report = {
         **conversion,
