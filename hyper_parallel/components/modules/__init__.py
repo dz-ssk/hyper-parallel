@@ -37,6 +37,8 @@ _EXPORT_TO_MODULE = {
     "NgramHashMapping": "engram",
     "PipelinedMhcModule": "mhc",
     "MLAAttention": "mla_attention",
+    "MultiTokenPrediction": "mtp",
+    "MultiTokenPredictionLayer": "mtp",
     "OffsetRMSNorm": "rms_norm",
     "RMSNorm": "rms_norm",
     "SharedExpert": "shared_expert",
