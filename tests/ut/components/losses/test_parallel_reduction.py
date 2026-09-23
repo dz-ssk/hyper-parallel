@@ -19,7 +19,7 @@ from unittest.mock import patch
 
 import torch
 
-from hyper_parallel.components.losses.parallel_reduction import model_parallel_mean
+from hyper_parallel.models.jt_deepseek_v3.adapter.distributed.jt_expert_parallel import _model_parallel_mean
 from tests.common.mark_utils import arg_mark
 
 
@@ -43,7 +43,7 @@ class TestParallelReduction(unittest.TestCase):
                 with patch("torch.distributed.get_world_size", return_value=size), \
                         patch("torch.distributed.all_reduce") as reduce:
                     reduce.side_effect = lambda tensor, **_: tensor.copy_(full.detach().square().sum())
-                    result = model_parallel_mean(local.square(), group)
+                    result = _model_parallel_mean(local.square(), group)
                     (result * 3).backward()
                     self.assertEqual(reduce.call_count, 1)
                     self.assertIs(reduce.call_args.kwargs["group"], group)
@@ -60,7 +60,7 @@ class TestParallelReduction(unittest.TestCase):
         value = torch.tensor(2., requires_grad=True)
         with patch("torch.distributed.all_reduce", side_effect=AssertionError), \
                 patch("torch.distributed.get_world_size", side_effect=AssertionError):
-            result = model_parallel_mean(value)
+            result = _model_parallel_mean(value)
             result.backward()
         self.assertIs(result, value)
         self.assertEqual(value.grad.item(), 1.)
