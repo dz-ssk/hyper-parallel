@@ -113,11 +113,11 @@ dataloader:
   sampler_type: single
   drop_last: true
   num_workers: 0
-# Retained local ten-step update policy; the optimizer owns clipping and schedule.
+# Native core Muon/AdamW with JT gradient clipping and schedule.
 optimizer:
-  _target_: hyper_parallel.models.jt_deepseek_v3.adapter.runtime.jt_training.JTAlignmentOptimizerBuilder
+  _target_: hyper_parallel.models.jt_deepseek_v3.adapter.runtime.jt_optimizer.JTOptimizerBuilder
 lr_scheduler:
-  _target_: hyper_parallel.models.jt_deepseek_v3.adapter.runtime.jt_training.JTAlignmentSchedule
+  _target_: hyper_parallel.models.jt_deepseek_v3.adapter.runtime.jt_optimizer.JTOptimizerSchedule
 checkpoint:
   save_ckpt: false
   checkpoint_dir: ./outputs/jt_deepseek_v3
