@@ -172,27 +172,6 @@ def resolve_reduce_op(op: Union[str, Any]) -> Any:
     return _OP_MAP.get(op, dist.ReduceOp.SUM) if isinstance(op, str) else op
 
 
-class _HCCLAllGatherConcat(torch.autograd.Function):
-    """Pair HCCL all-gather with native reduce-scatter in its backward."""
-
-    @staticmethod
-    def forward(ctx: Any, data: torch.Tensor, group: Any, concat_dim: int) -> torch.Tensor:
-        """Gather in process-group order and retain the concatenation axis."""
-        ctx.group, ctx.concat_dim = group, concat_dim
-        ctx.world = dist.get_world_size(group)
-        chunks = [torch.empty_like(data) for _ in range(ctx.world)]
-        dist.all_gather(chunks, data.contiguous(), group=group)
-        return torch.cat(chunks, dim=concat_dim)
-
-    @staticmethod
-    def backward(ctx: Any, gradient: torch.Tensor) -> tuple[torch.Tensor, None, None]:
-        """Use the native HCCL reduction tree for the summed input gradient."""
-        chunks = [value.contiguous() for value in gradient.chunk(ctx.world, dim=ctx.concat_dim)]
-        output = torch.empty_like(chunks[0])
-        dist.reduce_scatter(output, chunks, group=ctx.group)
-        return output, None, None
-
-
 class _TorchContiguousGrad(torch.autograd.Function):  # pylint: disable=abstract-method
     """Autograd identity that materializes gradients before upstream collectives."""
 
@@ -374,9 +353,6 @@ def differentiable_all_gather_concat(data: Tensor, group, concat_size: int, conc
     """
     del concat_size
     data = ensure_contiguous(data)
-    if dist.get_backend(group) == "hccl" and (
-            rank_list is None or tuple(rank_list) == tuple(dist.get_process_group_ranks(group))):
-        return _HCCLAllGatherConcat.apply(data, group, concat_dim)
     output = [
         _TorchContiguousGrad.apply(tensor)
         for tensor in dist_func.all_gather(data, group=group)
