@@ -40,7 +40,9 @@ from hyper_parallel.components.modules.mtp import DeepseekV3MTP
 from hyper_parallel.models.jt_deepseek_v3.adapter.conversion.mla_attention import MLAAttention, _MLALatents
 from hyper_parallel.components.functional.npu_fusion_attention import _prepare_fusion_attention_context
 from hyper_parallel.components.functional.npu_grouped_swiglu import npu_grouped_swiglu
-from hyper_parallel.core.dtensor._utils import differentiable_all_reduce
+from hyper_parallel.components.losses._vocab_parallel_cross_entropy import vocab_parallel_cross_entropy_local
+from hyper_parallel.components.losses.parallel_reduction import model_parallel_mean
+from hyper_parallel.core.tensor_parallel.loss_parallel import _get_loss_parallel_mesh
 from hyper_parallel.models.replacement import module_replacement
 from hyper_parallel.models.jt_deepseek_v3.configuration import JTDeepseekV3Config
 
@@ -455,8 +457,7 @@ class JTDeepseekV3MoE(DeepseekV32MoE):
             selected, auxiliary = RoutingProbabilities.apply(
                 logits, indices, frequency, config["routed_scaling_factor"], config["moe_aux_loss_coeff"],
                 config["norm_topk_prob"] and config["num_experts_per_tok"] > 1)
-            self.auxiliary_loss = (differentiable_all_reduce(auxiliary, "sum", group) / world
-                                   if group is not None else auxiliary)
+            self.auxiliary_loss = model_parallel_mean(auxiliary, group)
         if padding:
             pad_ids = torch.arange(padding * config["num_experts_per_tok"], device=indices.device)
             pad_ids = pad_ids.reshape(padding, config["num_experts_per_tok"]) % padding
@@ -597,123 +598,29 @@ def reference_sequence_sum(values: torch.Tensor) -> torch.Tensor:
     return total
 
 
-class VocabularyCrossEntropy(torch.autograd.Function):
-    """Differentiate the sharded NLL without autograd through eager collectives.
-
-    The loss adapter divides the replicated scalar by the explicit TP group
-    size before backward, matching the auxiliary loss's differentiable SUM.
-    A model without a group uses the complete vocabulary and local gradients.
-    """
-
-    @staticmethod
-    def forward(ctx: Any, logits: torch.Tensor, labels: torch.Tensor, mask: torch.Tensor,
-                group: Any) -> torch.Tensor:
-        """Save FP32 log probabilities and the masked NLL normalization.
-
-        Args:
-            ctx: Autograd context.
-            logits: Local logits.
-            labels: Pre-shifted target token IDs.
-            mask: Explicit loss weights.
-        """
-        values = logits.float()
-        maximum = values.amax(-1)
-        if group is not None:
-            dist.all_reduce(maximum, op=dist.ReduceOp.MAX, group=group)
-        stable = values - maximum.unsqueeze(-1)
-        denominator = stable.exp().sum(-1)
-        if group is not None:
-            dist.all_reduce(denominator, group=group)
-        local_labels = labels - (dist.get_rank(group) if group is not None else 0) * logits.shape[-1]
-        owned = (local_labels >= 0) & (local_labels < logits.shape[-1])
-        indices = local_labels.clamp(0, logits.shape[-1] - 1)
-        selected = stable.gather(-1, indices.unsqueeze(-1)).squeeze(-1) * owned
-        if group is not None:
-            dist.all_reduce(selected, group=group)
-        logarithm = denominator.log()
-        normalizer = reference_sequence_sum(mask) + 1e-8
-        ctx.save_for_backward(stable - logarithm.unsqueeze(-1), indices, owned, mask, normalizer)
-        ctx.world = dist.get_world_size(group) if group is not None else 1
-        ctx.dtype = logits.dtype
-        return reference_sequence_sum((logarithm - selected) * mask) / normalizer
-
-    @staticmethod
-    def backward(ctx: Any, upstream: torch.Tensor) -> tuple[torch.Tensor, None, None, None]:
-        """Preserve Exp(log_softmax), target subtraction and loss-repeat scaling.
-
-        Args:
-            ctx: Autograd context.
-            upstream: Upstream scalar gradient.
-        """
-        logarithm, indices, owned, mask, normalizer = ctx.saved_tensors
-        gradient = logarithm.exp()
-        gradient.scatter_add_(-1, indices.unsqueeze(-1), -owned.float().unsqueeze(-1))
-        scale = (upstream / normalizer) * mask
-        gradient = gradient * scale.unsqueeze(-1) * ctx.world
-        return gradient.to(ctx.dtype), None, None, None
-
-
-class _MaskedVocabLoss(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx: Any, logits: torch.Tensor, labels: torch.Tensor,
-                mask: torch.Tensor, group: Any) -> torch.Tensor:
-        """Compute stable distributed NLL and save its local derivative state.
-
-        Args:
-            ctx: Saved autograd state.
-            logits: Local vocabulary-sharded logits.
-            labels: Already-shifted target token IDs.
-            mask: Explicit loss weights.
-            group: Vocabulary process group.
-        """
-        values = logits.float()
-        maximum = values.amax(-1)
-        if group is not None:
-            dist.all_reduce(maximum, op=dist.ReduceOp.MAX, group=group)
-        stable = values - maximum.unsqueeze(-1)
-        exponential = stable.exp()
-        denominator = exponential.sum(-1)
-        if group is not None:
-            dist.all_reduce(denominator, group=group)
-        local_labels = labels - (dist.get_rank(group) if group is not None else 0) * logits.shape[-1]
-        owned = (local_labels >= 0) & (local_labels < logits.shape[-1])
-        indices = local_labels.clamp(0, logits.shape[-1] - 1)
-        selected = stable.gather(-1, indices.unsqueeze(-1)).squeeze(-1) * owned
-        if group is not None:
-            dist.all_reduce(selected, group=group)
-        normalizer = mask.sum() + 1e-8
-        ctx.save_for_backward(exponential / denominator.unsqueeze(-1), indices, owned, mask, normalizer)
-        ctx.input_dtype = logits.dtype
-        return ((denominator.log() - selected) * mask).sum() / normalizer
-
-    @staticmethod
-    def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[Any, ...]:
-        """Differentiate local logits without differentiating eager collectives.
-
-        Args:
-            ctx: Saved autograd state.
-            grad_output: Upstream scalar gradient.
-        """
-        probabilities, indices, owned, mask, normalizer = ctx.saved_tensors
-        gradient = probabilities.clone()
-        gradient.scatter_add_(-1, indices.unsqueeze(-1), -owned.to(gradient.dtype).unsqueeze(-1))
-        gradient = gradient * (mask * grad_output / normalizer).unsqueeze(-1)
-        return gradient.to(ctx.input_dtype), None, None, None
-
-
 def masked_vocab_parallel_loss(logits: torch.Tensor, labels: torch.Tensor,
-                               mask: torch.Tensor, group: Any) -> torch.Tensor:
-    """Compute masked NLL with an explicit vocabulary process group.
+                               mask: torch.Tensor, *, vocab_size: int) -> torch.Tensor:
+    """Use public CE gradients and retain only JT's masked reduction order.
 
     Args:
-        logits: Local vocabulary-sharded logits.
-        labels: Already-shifted target token IDs.
-        mask: Explicit loss weights.
-        group: Vocabulary process group.
+        logits: Full or vocabulary-sharded logits.
+        labels: Already-shifted targets, including negative ignored positions.
+        mask: Explicit supervision weights for the targets.
+        vocab_size: Logical global vocabulary size.
     """
-    if torch.is_grad_enabled():
-        return VocabularyCrossEntropy.apply(logits, labels, mask, group)
-    return _MaskedVocabLoss.apply(logits, labels, mask, group)
+    mesh = _get_loss_parallel_mesh()
+    targets = labels.masked_fill(labels < 0, -100)
+    weights = mask.masked_fill(labels < 0, 0)
+    values = logits.float().reshape(-1, logits.shape[-1])
+    if mesh is None:
+        if logits.shape[-1] != vocab_size:
+            raise ValueError("Vocabulary shards require the public loss_parallel context")
+        token_loss = F.cross_entropy(values, targets.reshape(-1), reduction="none", ignore_index=-100)
+    else:
+        token_loss = vocab_parallel_cross_entropy_local(
+            values, targets.reshape(-1), vocab_size=vocab_size, mesh=mesh,
+            ignore_index=-100, reduction="none")
+    return reference_sequence_sum(token_loss.reshape_as(weights) * weights) / (reference_sequence_sum(weights) + 1e-8)
 
 
 class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
@@ -751,20 +658,28 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
         self._aux_loss_monitor_scale = moe_layers * self.reference_config["moe_aux_loss_coeff"]
         self.post_init()
 
-    def forward(self, input_ids: torch.Tensor, labels: torch.Tensor,
-                loss_mask: torch.Tensor, use_cache: bool = False) -> CausalLMOutputWithPast:
+    def forward(self, input_ids: torch.Tensor, shift_labels: torch.Tensor | None = None,
+                loss_mask: torch.Tensor | None = None, *, labels: torch.Tensor | None = None,
+                position_ids: torch.Tensor | None = None, use_cache: bool = False) -> CausalLMOutputWithPast:
         """Use the same JT semantics for evaluation and Trainer backward.
 
         Args:
             input_ids: Unmodified token IDs.
-            labels: Already-shifted target token IDs.
+            shift_labels: Already-shifted targets from the public text batch.
             loss_mask: Mask for the pre-shifted targets.
+            labels: Public batch bookkeeping field; shift_labels owns supervision.
+            position_ids: Public sequence positions used to construct RoPE.
             use_cache: Whether cached decoding is requested.
         """
+        del labels
+        if shift_labels is None or loss_mask is None:
+            raise ValueError("JT training requires explicit shift_labels and loss_mask")
+        if shift_labels.shape != input_ids.shape or loss_mask.shape != input_ids.shape:
+            raise ValueError("JT input_ids, shift_labels and loss_mask must have matching shapes")
         if use_cache:
             raise ValueError("JT does not support cached decoding")
         with torch.autocast(input_ids.device.type, dtype=torch.bfloat16, cache_enabled=False):
-            losses = self.compute_jt_losses(input_ids, labels, loss_mask)
+            losses = self.compute_jt_losses(input_ids, shift_labels, loss_mask, position_ids=position_ids)
         metrics = torch.stack([losses[name].detach() for name in ("lm_loss", "mtp_loss", "aux_loss")])
         self._step_loss_metrics = metrics if self._step_loss_metrics is None else self._step_loss_metrics + metrics
         self._metric_micro_batches += 1
@@ -791,7 +706,8 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
         return metrics
 
     def compute_jt_losses(self, input_ids: torch.Tensor, labels: torch.Tensor,
-                           loss_mask: torch.Tensor) -> dict[str, torch.Tensor]:
+                         loss_mask: torch.Tensor, *, position_ids: torch.Tensor | None = None
+                         ) -> dict[str, torch.Tensor]:
 
         """Compute model-specific LM, MTP and router losses on pre-shifted labels.
 
@@ -799,6 +715,7 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
             input_ids: Unmodified token IDs.
             labels: Already-shifted target token IDs.
             loss_mask: Mask for the pre-shifted targets.
+            position_ids: Optional public batch positions for RoPE.
         """
         cfg = self.reference_config
         if input_ids.shape != (1, cfg["seq_length"]):
@@ -808,8 +725,12 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
         dim = cfg["qk_rope_head_dim"]
         inverse = 1.0 / (cfg["rope_theta"] ** (np.arange(0, dim, 2, dtype=np.float32) / dim))
         inverse = torch.from_numpy(inverse.astype(np.float32)).to(input_ids.device)
-        frequency = torch.arange(cfg["seq_length"], device=input_ids.device, dtype=torch.float32)[:, None] * inverse
-        frequency = torch.cat((frequency, frequency), dim=-1).unsqueeze(0)
+        if position_ids is None:
+            position_ids = torch.arange(cfg["seq_length"], device=input_ids.device).unsqueeze(0)
+        if position_ids.shape != input_ids.shape:
+            raise ValueError("JT position_ids must match input_ids")
+        frequency = position_ids.to(device=input_ids.device, dtype=torch.float32).unsqueeze(-1) * inverse
+        frequency = torch.cat((frequency, frequency), dim=-1)
         attention_kwargs = {"position_embeddings": (frequency.cos(), frequency.sin()),
                             "actual_seq_len": (cfg["seq_length"],)}
         hidden = self.model.embed_tokens(input_ids).to(torch.bfloat16)
@@ -820,12 +741,12 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
                 auxiliary = auxiliary + layer.mlp.auxiliary_loss
         hidden = hidden.float()
         lm_loss = masked_vocab_parallel_loss(
-            self.lm_head(self.model.norm(hidden).to(torch.bfloat16)), labels, loss_mask, self.loss_group)
+            self.lm_head(self.model.norm(hidden).to(torch.bfloat16)), labels, loss_mask, vocab_size=self.config.vocab_size)
         mtp_output = self.mtp(
             hidden, input_ids, embedding=self.model.embed_tokens, head=self.lm_head,
             labels=labels, loss_mask=loss_mask, loss_factor=cfg["mtp_loss_factor"],
             decoder_kwargs=attention_kwargs,
-            loss_fn=functools.partial(masked_vocab_parallel_loss, group=self.loss_group),
+            loss_fn=functools.partial(masked_vocab_parallel_loss, vocab_size=self.config.vocab_size),
             auxiliary_loss=auxiliary, auxiliary_fn=lambda decoder: decoder.mlp.auxiliary_loss,
         )
         mtp_loss, auxiliary = mtp_output.loss, mtp_output.auxiliary_loss

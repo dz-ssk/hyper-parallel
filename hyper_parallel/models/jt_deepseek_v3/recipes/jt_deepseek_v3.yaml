@@ -5,9 +5,8 @@ model:
   reference_yaml: /path/to/reference.yaml
   reference_weights: /path/to/initial_weights
 loss_fn:
-  _target_: hyper_parallel.models.jt_deepseek_v3.adapter.runtime.jt_loss.JTDeepseekV3Loss
-  input_mapping: {input_ids: input_ids, labels: shift_labels, loss_mask: loss_mask}
-  loss_group_attribute: loss_group
+  _target_: hyper_parallel.components.losses.ModelComputedLoss
+  pass_loss_inputs: true
 model_init_dtype: float32
 plan_overrides:
   # The base model is executable; replacements select acceleration and JT MTP precision.

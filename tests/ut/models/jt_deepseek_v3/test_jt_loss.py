@@ -12,108 +12,89 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Masked loss forward/backward contract on one emulated vocabulary rank."""
+"""Model-owned weighting around public cross entropy, without custom backward."""
 
 import unittest
-
 from unittest.mock import patch
 
 import torch
-from torch.nn import functional as F
+import torch.nn.functional as F
 
-from hyper_parallel.models.jt_deepseek_v3.adapter.runtime.jt_loss import (
-    JTDeepseekV3Loss,
-)
-
-
-from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import (
-    _MaskedVocabLoss, masked_vocab_parallel_loss,
-)
+from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import masked_vocab_parallel_loss
 from tests.common.mark_utils import arg_mark
 
 
 class TestJTLoss(unittest.TestCase):
-    """Use an independent dense CE oracle and explicit group assertions."""
+    """Check supervision, local ownership and public parallel dispatch."""
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_loss_and_gradient(self):
-        """Masked vocabulary CE has the same derivative as the dense objective.
+        """Feature: Masked objective.
 
-        Feature: jt_loss.
-        Description: Masked vocabulary CE has the same derivative as the dense objective.
-        Expectation: The asserted values and state transitions hold.
+        Description: Include ignored targets, fractional weights and a masked valid target.
+        Expectation: Public CE plus JT weighting matches independent dense autograd.
         """
         torch.manual_seed(12)
         values = torch.randn(1, 5, 7, requires_grad=True)
         oracle = values.detach().clone().requires_grad_()
-        labels = torch.tensor([[1, 2, 0, 4, 6]])
-        mask = torch.tensor([[1., 0., 1., 0., 1.]])
-        group = object()
-        with patch("torch.distributed.is_initialized", return_value=True), patch("torch.distributed.all_reduce") as reduce, patch("torch.distributed.get_rank", return_value=0):
-            actual = _MaskedVocabLoss.apply(values, labels, mask, group)
-            actual.backward()
-            self.assertEqual(reduce.call_count, 3)
-            self.assertTrue(all(call.kwargs["group"] is group for call in reduce.call_args_list))
+        labels = torch.tensor([[1, 2, -100, 4, 6]])
+        mask = torch.tensor([[0.25, 0., 0., 1.5, 1.]])
+        actual = masked_vocab_parallel_loss(values, labels, mask, vocab_size=7)
+        actual.backward()
         expected = (F.cross_entropy(oracle.flatten(0, 1), labels.flatten(), reduction="none") * mask.flatten()).sum()
-        expected = expected / mask.sum()
+        expected = expected / (mask.sum() + 1e-8)
         expected.backward()
         torch.testing.assert_close(actual, expected)
         torch.testing.assert_close(values.grad, oracle.grad)
-        self.assertEqual(torch.count_nonzero(values.grad[:, 1]).item(), 0)
+        self.assertEqual(torch.count_nonzero(values.grad[:, 1:3]).item(), 0)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_all_masked_is_zero(self):
-        """An empty objective stays finite and sends no gradient to logits.
+        """Feature: Empty supervision.
 
-        Feature: jt_loss.
-        Description: An empty objective stays finite and sends no gradient to logits.
-        Expectation: The asserted values and state transitions hold.
+        Description: Mask every target.
+        Expectation: Loss and logit gradients are finite zeros.
         """
         values = torch.randn(1, 2, 4, requires_grad=True)
-        with patch("torch.distributed.is_initialized", return_value=True), patch("torch.distributed.all_reduce"), patch("torch.distributed.get_rank", return_value=0):
-            loss = _MaskedVocabLoss.apply(values, torch.zeros(1, 2, dtype=torch.long), torch.zeros(1, 2), None)
-            loss.backward()
+        loss = masked_vocab_parallel_loss(values, torch.full((1, 2), -100), torch.zeros(1, 2), vocab_size=4)
+        loss.backward()
         self.assertEqual(loss.item(), 0.)
         self.assertEqual(values.grad.abs().sum().item(), 0.)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
-    def test_pre_shifted_labels_and_mask_are_preserved(self):
-        """The loss adapter must neither shift labels again nor reconstruct masks.
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_public_parallel_dispatch_and_missing_mesh(self):
+        """Feature: Framework CE ownership.
 
-        Feature: jt_loss.
-        Description: The loss adapter must neither shift labels again nor reconstruct masks.
-        Expectation: The asserted values and state transitions hold.
+        Description: Supply a public mesh and then omit it for incomplete logits.
+        Expectation: Parallel CE receives the logical vocabulary and missing mesh fails clearly.
         """
-        ids = torch.tensor([[3, 4]])
-        labels = torch.tensor([[4, 5]])
-        mask = torch.tensor([[0., 1.]])
-        result = JTDeepseekV3Loss(input_mapping={"input_ids": "input_ids", "labels": "shift_labels",
-                                                 "loss_mask": "loss_mask"}).prepare_model_inputs(
-            {"input_ids": ids}, {"shift_labels": labels, "loss_mask": mask})
-        self.assertIs(result["labels"], labels)
-        self.assertIs(result["loss_mask"], mask)
+        prefix = "hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3."
+        values, labels, mask = torch.randn(1, 2, 4), torch.tensor([[1, 5]]), torch.ones(1, 2)
+        mesh = object()
+        with patch(prefix + "_get_loss_parallel_mesh", return_value=mesh), \
+                patch(prefix + "vocab_parallel_cross_entropy_local", return_value=torch.tensor([2., 4.])) as ce:
+            result = masked_vocab_parallel_loss(values, labels, mask, vocab_size=8)
+        self.assertEqual(result.item(), 3.)
+        self.assertIs(ce.call_args.kwargs["mesh"], mesh)
+        self.assertEqual(ce.call_args.kwargs["reduction"], "none")
+        with self.assertRaisesRegex(ValueError, "loss_parallel context"):
+            masked_vocab_parallel_loss(values, labels, mask, vocab_size=8)
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="onecard", essential_mark="essential")
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_unbound_loss_never_uses_the_default_process_group(self):
-        """Feature: Explicit vocabulary ownership.
+        """Feature: Local standalone model.
 
-        Description: Run a full-vocabulary objective while a default group exists.
-        Expectation: Both forward paths and backward remain local without a bound TP group.
+        Description: Run full-vocabulary CE while an unrelated default group exists.
+        Expectation: Neither training nor evaluation queries that group.
         """
-        labels = torch.tensor([[1, 2]])
-        mask = torch.ones(1, 2)
-        with patch("torch.distributed.is_initialized", return_value=True), \
-                patch("torch.distributed.all_reduce", side_effect=AssertionError), \
+        labels, mask = torch.tensor([[1, 2]]), torch.ones(1, 2)
+        with patch("torch.distributed.all_reduce", side_effect=AssertionError), \
                 patch("torch.distributed.get_rank", side_effect=AssertionError), \
                 patch("torch.distributed.get_world_size", side_effect=AssertionError):
             values = torch.randn(1, 2, 4, requires_grad=True)
-            loss = masked_vocab_parallel_loss(values, labels, mask, None)
+            loss = masked_vocab_parallel_loss(values, labels, mask, vocab_size=4)
             loss.backward()
             with torch.no_grad():
-                evaluated = masked_vocab_parallel_loss(values, labels, mask, None)
+                evaluated = masked_vocab_parallel_loss(values, labels, mask, vocab_size=4)
         torch.testing.assert_close(loss, evaluated)
         self.assertTrue(torch.isfinite(values.grad).all())
