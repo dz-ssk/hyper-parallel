@@ -32,8 +32,6 @@ from __future__ import annotations
 
 from typing import Any, NamedTuple, Optional, Tuple, TYPE_CHECKING
 
-# AutoModels loss components implement the Torch Trainer contract.
-# pylint: disable=forbidden-backend-import
 import torch
 import torch.distributed.nn.functional as dist_func
 from torch import Tensor

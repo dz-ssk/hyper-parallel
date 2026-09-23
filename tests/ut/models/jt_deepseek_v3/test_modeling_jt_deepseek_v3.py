@@ -33,7 +33,7 @@ from hyper_parallel.models.replacement import compile_module_replacements, apply
 from hyper_parallel.models.jt_deepseek_v3.adapter.jt_builder import _load_reference_state
 from hyper_parallel.models.registry import get_model_adapter
 from hyper_parallel.trainer.config import entries_to_module_replacements
-from hyper_parallel.trainer.config.manager import parse_training_args
+from hyper_parallel.trainer.config.parser import parse_training_args
 from tests.common.mark_utils import arg_mark
 
 

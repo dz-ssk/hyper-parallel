@@ -47,7 +47,7 @@ class TestVocabParallelTokenLoss(unittest.TestCase):
             mesh.get_local_rank.return_value = rank
             mesh.size.return_value = 2
             local = dense.detach()[:, rank * 4:(rank + 1) * 4].clone().requires_grad_()
-            with patch.object(ce.platform, "differentiable_all_reduce", side_effect=[
+            with patch.object(ce, "_differentiable_all_reduce", side_effect=[
                     maximum, denominator, expected.detach()]) as reduce:
                 actual = ce.vocab_parallel_cross_entropy_local(
                     local, targets, vocab_size=8, mesh=mesh, reduction="none")
