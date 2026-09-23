@@ -13,7 +13,7 @@ lazy adapter registration. The standard `deepseek_v3` family is independent.
 | `adapter/conversion/` | Checkpoint mapping, MLA projection implementation and JT MTP execution policy |
 | `adapter/distributed/` | Bind model-owned expert semantics to Hyper EP dispatch and communication |
 | `adapter/policies/` | Declarative parameter sharding roles |
-| `adapter/runtime/` | Pre-shifted dataset inputs, Trainer loss binding and retained alignment optimizer |
+| `adapter/runtime/` | JT-specific loss-gradient scaling and retained alignment optimizer |
 | `adapter/jt_builder.py` | Build, optionally replace, strictly load weights and apply Hyper infrastructure |
 | `recipes/jt_deepseek_v3.yaml` | Replacement, parallel layout and runtime component selection |
 
@@ -81,7 +81,7 @@ torchrun --nproc_per_node=8 examples/training_demo/train_text.py \
   hyper_parallel/models/jt_deepseek_v3/recipes/jt_deepseek_v3.yaml \
   --model.reference_yaml=/path/to/reference.yaml \
   --model.reference_weights=/path/to/initial_weights \
-  --dataset.data_path=/path/to/shared_tokens.npz
+  --dataset.data_path=/path/to/supervised_prefix
 ```
 
 The retained alignment recipe requires a batch of one full 262144-token sequence,
@@ -94,3 +94,57 @@ established by this recipe's regression test.
 The common entry calls `TextTrainer.train()`. No model-specific launcher or
 train/evaluate branch is added. Setting `train_iters: 1` still executes a training
 step, including backward and update; it does not select evaluation-only behavior.
+
+## Public supervised data and loss adapter
+
+The recipe uses `IndexedSupervisedDataset`, the shared `FixedBatchDataLoader`,
+and `TextParallelBatch`. There is no model-owned dataset or batch implementation.
+A data prefix identifies three aligned standard Megatron indexed streams:
+
+| Stream suffix | Stored content | Batch dtype |
+| --- | --- | --- |
+| `.tokens.bin` / `.tokens.idx` | Complete input token records | int64 |
+| `.labels.bin` / `.labels.idx` | Already shifted targets, including ignored labels | int64 |
+| `.loss_mask.bin` / `.loss_mask.idx` | Explicit nonnegative supervision weights | float32 |
+
+All streams must have matching record lengths and document boundaries. The
+Dataset preserves record order; DataLoader sampling determines training order.
+This is a supervised extension using the public indexed reader, not a claim
+that a token-only GPT corpus contains instruction supervision automatically.
+No extra token is appended and no labels are reconstructed. Fixed-size records
+must contain the configured full 262144-token sequence.
+
+`preserve_loss_mask: true` selects the shared batch path that preserves explicit
+weights through CP slicing and TP broadcast, including fractional weights.
+The default public text batch still derives its binary mask from labels.
+The recipe uses compressed attention metadata and does not build a quadratic
+256K attention mask. The model input mapping passes only input IDs, shifted
+labels and loss weights to the current complete-sequence JT model.
+
+`ModelComputedLoss` owns configurable input mapping, optional TP loss-group
+binding and extraction of the already combined model objective. It neither
+shifts labels nor suppresses auxiliary loss when supervised labels are all
+ignored, and does not impose TP gradient scaling. `JTDeepseekV3Loss` inherits
+that public adapter and retains only the existing replicated-gradient division,
+which is paired with JT's custom vocabulary-loss backward implementation.
+
+## Per-step loss and QK-clip metrics
+
+The common `LoggingCallback` consumes optional `get_logging_metrics()` hooks on
+its model and optimizer once per optimizer step, on every rank. Providers own
+any distributed reduction; rank zero prints at `training.logging_steps` cadence.
+These detached observations are not entries in the Trainer backward loss dict.
+
+JT reports `training/lm_loss`, `training/mtp_loss`, and `training/aux_loss`.
+MTP and auxiliary values include the configured coefficients; the objective is
+`(lm_loss + aux_loss) + mtp_loss`. Values are microbatch means for the supported
+TP-replicated, DP1/CP1 recipe (one microbatch per step).
+
+The optimizer captures `optimizer/qkclip_maxlogits/<module path>` before QK-clip
+clears the attention statistic, then takes the maximum across TP head shards.
+`optimizer/qkclip_maxlogits` is the maximum across all participating attention
+modules, including the MTP decoder. These are the attention statistics used by
+QK clipping, not vocabulary logits or maxima recomputed after clipping. Only
+scalar snapshots and a packed TP MAX reduction are added; attention matrices
+are not retained for logging. Terminal scalar formatting uses nine significant
+digits so FP32 loss differences remain visible.

@@ -90,7 +90,8 @@ class TestJTLoss(unittest.TestCase):
         ids = torch.tensor([[3, 4]])
         labels = torch.tensor([[4, 5]])
         mask = torch.tensor([[0., 1.]])
-        result = JTDeepseekV3Loss.prepare_model_inputs(
+        result = JTDeepseekV3Loss(input_mapping={"input_ids": "input_ids", "labels": "shift_labels",
+                                                 "loss_mask": "loss_mask"}).prepare_model_inputs(
             {"input_ids": ids}, {"shift_labels": labels, "loss_mask": mask})
         self.assertIs(result["labels"], labels)
         self.assertIs(result["loss_mask"], mask)
