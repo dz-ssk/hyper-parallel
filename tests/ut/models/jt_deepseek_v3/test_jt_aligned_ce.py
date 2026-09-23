@@ -41,7 +41,7 @@ class TestVocabularyCrossEntropy(unittest.TestCase):
         with patch.object(loss, "dist") as communication:
             communication.get_rank.return_value = 0
             communication.get_world_size.return_value = 1
-            result = loss.VocabularyCrossEntropy.apply(logits, labels, mask, None)
+            result = loss.masked_vocab_parallel_loss(logits, labels, mask, vocab_size=logits.shape[-1])
             result.backward()
         expected = torch.tensor([[[1 / 6, 1 / 6, -1 / 2, 1 / 6],
                                   [0, 0, 0, 0], [-1 / 4, 1 / 12, 1 / 12, 1 / 12]]])
@@ -60,7 +60,8 @@ class TestVocabularyCrossEntropy(unittest.TestCase):
         with patch.object(loss, "dist") as communication:
             communication.get_rank.return_value = 0
             communication.get_world_size.return_value = 1
-            result = loss.VocabularyCrossEntropy.apply(logits, torch.full((1, 3), -100), torch.zeros(1, 3), None)
+            result = loss.masked_vocab_parallel_loss(
+                logits, torch.full((1, 3), -100), torch.zeros(1, 3), vocab_size=4)
             result.backward()
         self.assertEqual(result.item(), 0)
         self.assertTrue(torch.equal(logits.grad, torch.zeros_like(logits)))
