@@ -3,9 +3,9 @@
 This revision targets `trainer_dev`. It incorporates the functional directory
 split built on `21a84e6b` and keeps the original `deepseek_v3/` family and public
 `components/modules/mla_attention.py` identical to that baseline.
-The base currently exposed by GitHub is `edd4fae9`; therefore the PR also includes
-the prerequisite diagnostics change `b7136e25` and its upstream merge. These are
-upstream prerequisites, not newly authored JT changes.
+The branch is rebased directly on upstream `trainer_dev` at `21a84e6b`.
+Diagnostics change `b7136e25` is already part of that base and must not appear
+as a new PR change. Review the three-dot diff against the current target branch.
 
 ## Model and MTP
 
@@ -42,9 +42,11 @@ upstream prerequisites, not newly authored JT changes.
    forwarding of the public supervision fields. Preserve model-computed aux
    losses even when all supervised tokens are ignored.
 
-`54de5a6b` records ancestry from the existing PR branch without restoring its
-superseded layout. It preserves PR history and permits a normal fast-forward
-push; it introduces no file changes and is not a numerical change.
+The previous PR revision and its merge history are archived locally. The active
+branch has a linear history starting at `21a84e6b`; superseded first-loss commits
+and the history-preserving merge are excluded. Rebase does not change the tested
+model code. The existing PR is updated in place so its submitted reviews remain
+available, although comments on changed lines may become outdated.
 
 ## Validation status at publication
 
