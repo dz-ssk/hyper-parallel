@@ -1,0 +1,118 @@
+# Run the configured JT model through the standard Trainer training loop.
+# Provide the reference configuration and its exported initial weights.
+model:
+  _target_: hyper_parallel.models.jt_deepseek_v3.adapter.jt_builder.build_jt_model
+  reference_yaml: /path/to/reference.yaml
+  reference_weights: /path/to/initial_weights
+loss_fn:
+  _target_: hyper_parallel.models.jt_deepseek_v3.adapter.runtime.jt_loss.JTDeepseekV3Loss
+model_init_dtype: float32
+plan_overrides:
+  # The base model is executable; replacements select acceleration and JT MTP precision.
+  - match:
+      - "model.layers.*.self_attn"
+      - "mtp.layers.*.transformer_layer.self_attn"
+    module_type: hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3.JTDeepseekV3Attention
+    exact_type: true
+    replace_module:
+      _target_: hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3.JTDeepseekV3MLAAttention
+  - match: "mtp.execution"
+    module_type: hyper_parallel.components.modules.mtp.DeepseekV3MTPExecution
+    exact_type: true
+    replace_module:
+      _target_: hyper_parallel.models.jt_deepseek_v3.adapter.conversion.jt_mtp.JTDeepseekV3MTPExecution
+  - match: "*.self_attn"
+    params:
+      linear_qkv.weight: {tp: replicate}
+      q_b_proj.weight: {tp: "shard(0)"}
+      kv_b_proj.weight: {tp: "shard(0)"}
+      o_proj.weight: {tp: "shard(1)"}
+    region_dispatch: false
+    in_src:
+      hidden_states: {tp: "shard(1)"}
+    in_dst:
+      hidden_states: {tp: "shard(1)"}
+  - match: "*.self_attn.*_layernorm"
+    in_src:
+      hidden_states: {tp: "shard(1)"}
+    in_dst:
+      hidden_states: {tp: "shard(1)"}
+    out_src: {tp: "shard(1)"}
+    out_dst: {tp: replicate}
+  - match: "*.self_attn.key_rope_gather"
+    in_src:
+      input: {tp: "shard(1)"}
+    in_dst:
+      input: {tp: "shard(1)"}
+    out_src: {tp: "shard(1)"}
+    out_dst: {tp: replicate}
+  - match: "*.mlp.shared_experts"
+    params:
+      gate_proj.weight: {tp: replicate}
+      up_proj.weight: {tp: replicate}
+      down_proj.weight: {tp: replicate}
+    in_src:
+      x: {tp: "shard(1)"}
+    in_dst:
+      x: {tp: "shard(1)"}
+    out_src: {tp: "shard(1)"}
+    out_dst: {tp: "shard(1)"}
+  - match: "mtp.layers.*.eh_proj"
+    params:
+      weight: {tp: replicate}
+    in_src:
+      input: {tp: "shard(1)"}
+    in_dst:
+      input: {tp: "shard(1)"}
+    out_src: {tp: "shard(1)"}
+    out_dst: {tp: "shard(1)"}
+  - match: "mtp.layers.*.transformer_layer.mlp"
+    when: ep
+    region_dispatch: false
+    local_compute_fn:
+      _target_: hyper_parallel.models.jt_deepseek_v3.adapter.distributed.jt_expert_parallel.jt_deepseek_v3_ep_compute
+training:
+  train_iters: 10
+  max_grad_norm: 0.0
+  global_batch_size: 1
+  micro_batch_size: 1
+  backend: hccl
+  init_device: cpu
+  seed: 42
+  # The alignment optimizer preserves the captured deterministic NPU policy.
+  enable_full_determinism: false
+accelerator:
+  tp_size: 8
+  ep_size: 8
+  cp_size: 1
+  pp_size: 1
+  sequence_parallel: true
+  loss_parallel: true
+fsdp_config:
+  dp_shard_size: 1
+activation_checkpoint:
+  mode: "off"
+activation_swap: none
+dataset:
+  _target_: hyper_parallel.models.jt_deepseek_v3.adapter.runtime.jt_data.NpzJTDataset
+  data_path: /path/to/shared_tokens.npz
+  model_assets:
+    tokenizer: null
+  data_transform: null
+dataloader:
+  _target_: hyper_parallel.data.batching.FixedBatchDataLoader
+  collate_fn:
+    _target_: hyper_parallel.data.batching.build_default_collate_fn
+  get_batch:
+    _target_: hyper_parallel.models.jt_deepseek_v3.adapter.runtime.jt_data.PreShiftedJTBatch
+  sampler_type: single
+  drop_last: true
+  num_workers: 0
+# Retained local ten-step update policy; the optimizer owns clipping and schedule.
+optimizer:
+  _target_: hyper_parallel.models.jt_deepseek_v3.adapter.runtime.jt_training.JTAlignmentOptimizerBuilder
+lr_scheduler:
+  _target_: hyper_parallel.models.jt_deepseek_v3.adapter.runtime.jt_training.JTAlignmentSchedule
+checkpoint:
+  save_ckpt: false
+  checkpoint_dir: ./outputs/jt_deepseek_v3
