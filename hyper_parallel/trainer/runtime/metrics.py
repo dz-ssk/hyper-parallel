@@ -1,4 +1,5 @@
 # Copyright 2025-2026 Bytedance Ltd. and/or its affiliates
+# Copyright 2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,6 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Global loss metrics reduction across data/context parallel ranks."""
+
+# This adapter uses the Torch/HF runtime, like the existing model and Trainer modules.
+# pylint: disable=forbidden-backend-import
 
 from __future__ import annotations
 
@@ -77,6 +81,14 @@ def mean_global_loss(
             op="sum",
             group=dp_cp_group,
         )
+
+        if all_reduced_len != 0 and device_mesh.dp_size == 1 and device_mesh.cp_size == 1:
+            # With one data/context rank there is nothing to average. Form the
+            # token ratio first so a single micro-batch preserves the input loss
+            # exactly instead of rounding it through multiply/divide by tokens.
+            weight = cur_token_len / (all_reduced_len * sequence_parallel_size)
+            loss_dict[key] = cur_loss * weight
+            continue
 
         if all_reduced_len != 0:
             local_weighted_loss = cur_loss * cur_token_len
