@@ -12,11 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Shared model-computed loss protocol without model-specific numerical policy."""
+"""Public supervision forwarding and unmodified model-computed objectives."""
 
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock
 
 import torch
 
@@ -25,43 +24,39 @@ from tests.common.mark_utils import arg_mark
 
 
 class TestModelComputedLoss(unittest.TestCase):
-    """Check explicit input mapping, auxiliary preservation and group ownership."""
+    """Verify forwarding without renaming, shifting or numerical compensation."""
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_combined_loss_keeps_auxiliary_and_gradient(self):
         """Feature: Model-owned objective.
 
-        Description: Return a combined objective when supervised labels are all masked.
-        Expectation: The adapter neither zeros auxiliary terms nor scales gradients.
+        Description: Return an auxiliary objective while all labels are masked.
+        Expectation: The returned tensor and its unit derivative are unchanged.
         """
         value = torch.tensor(2., requires_grad=True)
-        adapter = ModelComputedLoss()
-        result = adapter(model_output=SimpleNamespace(loss=value), labels=torch.full((1, 2), -100))
+        result = ModelComputedLoss()(model_output=SimpleNamespace(loss=value), labels=torch.full((1, 2), -100))
         self.assertIs(result, value)
         result.backward()
         self.assertEqual(value.grad.item(), 1.)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
-    def test_mapping_and_explicit_group_binding(self):
-        """Feature: Shared Trainer adaptation.
+    def test_opt_in_supervision_keeps_public_names_and_identity(self):
+        """Feature: Public forward fields.
 
-        Description: Translate a configurable supervision field and bind one explicit TP group.
-        Expectation: Tensors are preserved by identity and unbound operation uses no default group.
+        Description: Supply separate model and loss dictionaries, including shared labels.
+        Expectation: Opt-in forwarding preserves tensors and metadata without mutating either input.
         """
-        adapter = ModelComputedLoss({"targets": "shift_labels"}, loss_group_attribute="vocabulary_group")
-        labels = torch.tensor([[3, -100]])
-        result = adapter.prepare_model_inputs({"unused": 1}, {"shift_labels": labels})
-        self.assertEqual(set(result), {"targets"})
-        self.assertIs(result["targets"], labels)
-        with self.assertRaisesRegex(ValueError, "missing"):
-            adapter.prepare_model_inputs({}, {})
-        model, group = SimpleNamespace(), object()
-        tp = Mock()
-        tp.get_group.return_value = group
-        setup = SimpleNamespace(mesh_context=SimpleNamespace(tp_size=8, loss_parallel=True, device_mesh={"tp": tp}))
-        adapter.bind_model(model, setup)
-        self.assertIs(model.vocabulary_group, group)
-        self.assertIs(adapter.loss_group, group)
-        adapter.bind_model(model)
-        self.assertIsNone(model.vocabulary_group)
-        self.assertIsNone(adapter.loss_group)
+        labels, mask = torch.tensor([[3, -100]]), torch.tensor([[0.5, 0.]])
+        model_inputs = {"labels": labels, "position_ids": torch.tensor([[0, 1]])}
+        loss_inputs = {"labels": labels, "shift_labels": labels, "loss_mask": mask}
+        default = ModelComputedLoss().prepare_model_inputs(model_inputs, loss_inputs)
+        self.assertEqual(set(default), set(model_inputs))
+        result = ModelComputedLoss(pass_loss_inputs=True).prepare_model_inputs(model_inputs, loss_inputs)
+        self.assertEqual(set(result), set(model_inputs) | set(loss_inputs))
+        self.assertIs(result["shift_labels"], labels)
+        self.assertIs(result["loss_mask"], mask)
+        self.assertIs(result["position_ids"], model_inputs["position_ids"])
+        self.assertNotIn("loss_mask", model_inputs)
+        with self.assertRaisesRegex(ValueError, "Conflicting"):
+            ModelComputedLoss(pass_loss_inputs=True).prepare_model_inputs(
+                model_inputs, {"labels": labels.clone()})
