@@ -395,6 +395,10 @@ class DistributedCrossEntropyFunction(torch.autograd.Function):
             if total_weight.item() == 0:
                 return torch.tensor(float('nan'), dtype=loss.dtype, device=loss.device)
             return loss / total_weight
+        if reduction == "none":
+            # Sum per-token values inside this Function so replicated upstream
+            # gradients differentiate each local vocabulary slice only once.
+            return _differentiable_all_reduce(loss, op="sum", group=mesh.get_group(mesh_dim))
         return loss
 
     @staticmethod
