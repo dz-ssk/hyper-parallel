@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from typing import Any, Dict, Optional, Union
 
 # AutoModels loss components implement the Transformers/PyTorch Trainer API.
@@ -66,50 +65,33 @@ class ModelComputedLoss(ModelOutputLoss):
     when all supervised tokens are masked.
     """
 
-    def __init__(self, input_mapping: Mapping[str, str] | None = None,
-                 loss_group_attribute: str | None = None) -> None:
-        """Configure model input names and optional vocabulary-parallel binding.
+    def __init__(self, *, pass_loss_inputs: bool = False) -> None:
+        """Select whether supervision fields are also model forward arguments.
 
         Args:
-            input_mapping: Model argument to public batch field mapping; None
-                passes existing model inputs through unchanged.
-            loss_group_attribute: Optional model attribute receiving the TP
-                group when loss parallelism is enabled. No binding by default.
+            pass_loss_inputs: Forward supervision under its public batch names.
+                False preserves the existing model-input dictionary unchanged.
         """
         super().__init__()
-        self.input_mapping = None if input_mapping is None else dict(input_mapping)
-        self.loss_group_attribute = loss_group_attribute
-        self.loss_group = None
-
-    def bind_model(self, model: torch.nn.Module, distributed_setup: Any = None) -> None:
-        """Bind an explicitly requested vocabulary group without default-group fallback.
-
-        Args:
-            model: Constructed model owning the vocabulary objective.
-            distributed_setup: Trainer mesh and loss parallelism settings.
-        """
-        if self.loss_group_attribute is None:
-            return
-        mesh = getattr(distributed_setup, "mesh_context", None)
-        self.loss_group = None
-        if mesh is not None and getattr(mesh, "tp_size", 1) > 1 and getattr(mesh, "loss_parallel", False):
-            self.loss_group = mesh.device_mesh["tp"].get_group()
-        setattr(model, self.loss_group_attribute, self.loss_group)
+        self.pass_loss_inputs = pass_loss_inputs
 
     def prepare_model_inputs(self, model_inputs: dict, loss_inputs: dict) -> dict:
-        """Map public batch fields into the model signature without shifting or masking.
+        """Pass supervision to model-owned objectives without renaming or shifting.
 
         Args:
             model_inputs: Forward fields from the public batch runtime.
             loss_inputs: Supervision and token-accounting fields from that runtime.
+
+        Returns:
+            A new dictionary preserving each supplied tensor by identity.
         """
-        if self.input_mapping is None:
-            return dict(model_inputs)
-        fields = {**model_inputs, **loss_inputs}
-        missing = set(self.input_mapping.values()) - fields.keys()
-        if missing:
-            raise ValueError(f"Model loss input mapping is missing batch fields: {sorted(missing)}")
-        return {target: fields[source] for target, source in self.input_mapping.items()}
+        result = dict(model_inputs)
+        if self.pass_loss_inputs:
+            for name, value in loss_inputs.items():
+                if name in result and result[name] is not value:
+                    raise ValueError(f"Conflicting model and loss input: {name}")
+                result[name] = value
+        return result
 
     def forward(self, *, model_output: Any, labels: Optional[torch.Tensor] = None
                 ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
