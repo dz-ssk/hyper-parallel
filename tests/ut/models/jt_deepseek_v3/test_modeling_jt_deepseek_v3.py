@@ -199,3 +199,23 @@ class TestCompleteModel(unittest.TestCase):
         model._step_loss_metrics = torch.tensor([2.0, 0.3, 0.0])
         model._metric_micro_batches = 1
         self.assertEqual(model.get_logging_metrics()["training/load_balancing_loss"].item(), 0.0)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_public_batch_fields_reach_model_without_mapping(self):
+        """Feature: Native Trainer input contract.
+
+        Description: Pass bookkeeping labels, shifted labels, mask and positions directly.
+        Expectation: Shifted targets and positions reach the objective unchanged; missing targets fail.
+        """
+        model = JTDeepseekV3ForCausalLM(small_config())
+        tokens = torch.arange(8).unsqueeze(0)
+        shifted, mask = tokens + 1, torch.ones(1, 8)
+        positions = tokens + 2
+        values = {"loss": torch.tensor(3.), "lm_loss": torch.tensor(2.),
+                  "mtp_loss": torch.tensor(0.9), "aux_loss": torch.tensor(0.1)}
+        with patch.object(model, "compute_jt_losses", return_value=values) as compute:
+            model(input_ids=tokens, labels=tokens, shift_labels=shifted, loss_mask=mask, position_ids=positions)
+        self.assertIs(compute.call_args.args[1], shifted)
+        self.assertIs(compute.call_args.kwargs["position_ids"], positions)
+        with self.assertRaisesRegex(ValueError, "explicit shift_labels"):
+            model(input_ids=tokens, labels=tokens, loss_mask=mask)

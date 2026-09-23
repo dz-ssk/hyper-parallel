@@ -13,7 +13,7 @@ lazy adapter registration. The standard `deepseek_v3` family is independent.
 | `adapter/conversion/` | Checkpoint mapping, MLA projection implementation and JT MTP execution policy |
 | `adapter/distributed/` | Bind model-owned expert semantics to Hyper EP dispatch and communication |
 | `adapter/policies/` | Declarative parameter sharding roles |
-| `adapter/runtime/` | JT-specific loss-gradient scaling and retained alignment optimizer |
+| `adapter/runtime/` | Retained alignment optimizer and logical parameter views |
 | `adapter/jt_builder.py` | Build, optionally replace, strictly load weights and apply Hyper infrastructure |
 | `recipes/jt_deepseek_v3.yaml` | Replacement, parallel layout and runtime component selection |
 
@@ -118,15 +118,31 @@ must contain the configured full 262144-token sequence.
 weights through CP slicing and TP broadcast, including fractional weights.
 The default public text batch still derives its binary mask from labels.
 The recipe uses compressed attention metadata and does not build a quadratic
-256K attention mask. The model input mapping passes only input IDs, shifted
-labels and loss weights to the current complete-sequence JT model.
+256K attention mask. The model accepts public `shift_labels`, `loss_mask` and
+`position_ids` directly. `shift_labels` is mandatory and is never shifted again;
+`labels` remains available for Trainer bookkeeping. `ModelComputedLoss` forwards
+supervision under the same field names with `pass_loss_inputs: true` and reads
+the complete objective without masking auxiliary terms or scaling gradients.
+There is no model-owned data reader or loss adapter.
 
-`ModelComputedLoss` owns configurable input mapping, optional TP loss-group
-binding and extraction of the already combined model objective. It neither
-shifts labels nor suppresses auxiliary loss when supervised labels are all
-ignored, and does not impose TP gradient scaling. `JTDeepseekV3Loss` inherits
-that public adapter and retains only the existing replicated-gradient division,
-which is paired with JT's custom vocabulary-loss backward implementation.
+LM and MTP use Hyper's shared vocabulary-parallel CE with per-token outputs.
+JT retains its explicit mask, normalization epsilon and ordered sequence sum.
+The shared CE returns global per-token losses on every vocabulary rank, with
+one local-shard derivative. It does not multiply gradients by TP size.
+The former model-owned CE backward and total-objective gradient division are
+removed together.
+
+MoE auxiliary values are means of equally sized token partitions. The shared
+`model_parallel_mean` reduces their forward values and differentiates each
+local contribution once. Its output is one logical replicated loss, not several
+independently consumed objectives; this is distinct from an autograd all-reduce
+that sums every replica's upstream derivative. This boundary does not alter LM
+or MTP gradients. Other partition sizes/topologies need explicit token weighting.
+
+The public-loss refactor changes floating-point evaluation and backward order.
+Earlier ten-step equality is historical evidence for the archived implementation,
+not an accuracy claim for this revision. The new 256K TP8/EP8 regression is run
+separately after publishing the review changes.
 
 ## Per-step loss and QK-clip metrics
 
