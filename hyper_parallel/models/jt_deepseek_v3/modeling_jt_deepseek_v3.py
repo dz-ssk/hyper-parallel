@@ -41,7 +41,6 @@ from hyper_parallel.models.jt_deepseek_v3.adapter.conversion.mla_attention impor
 from hyper_parallel.components.functional.npu_fusion_attention import _prepare_fusion_attention_context
 from hyper_parallel.components.functional.npu_grouped_swiglu import npu_grouped_swiglu
 from hyper_parallel.components.losses._vocab_parallel_cross_entropy import vocab_parallel_cross_entropy_local
-from hyper_parallel.components.losses.parallel_reduction import model_parallel_mean
 from hyper_parallel.core.tensor_parallel.loss_parallel import _get_loss_parallel_mesh
 from hyper_parallel.models.replacement import module_replacement
 from hyper_parallel.models.jt_deepseek_v3.configuration import JTDeepseekV3Config
@@ -457,7 +456,7 @@ class JTDeepseekV3MoE(DeepseekV32MoE):
             selected, auxiliary = RoutingProbabilities.apply(
                 logits, indices, frequency, config["routed_scaling_factor"], config["moe_aux_loss_coeff"],
                 config["norm_topk_prob"] and config["num_experts_per_tok"] > 1)
-            self.auxiliary_loss = model_parallel_mean(auxiliary, group)
+            self.auxiliary_loss = auxiliary
         if padding:
             pad_ids = torch.arange(padding * config["num_experts_per_tok"], device=indices.device)
             pad_ids = pad_ids.reshape(padding, config["num_experts_per_tok"]) % padding
