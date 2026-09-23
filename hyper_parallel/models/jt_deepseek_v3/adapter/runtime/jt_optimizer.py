@@ -127,6 +127,7 @@ class ReferenceMuon(torch.optim.Optimizer):
     def __init__(self, model: nn.Module, config: SimpleNamespace, parallel: SimpleNamespace) -> None:
         """Route vocabulary/norm parameters to AdamW and matrices to Muon."""
         self.named = list(model.named_parameters())
+        self.last_max_logits = {}
         self.config = config
         self.parallel = parallel
         self.model = model
@@ -225,10 +226,12 @@ class ReferenceMuon(torch.optim.Optimizer):
 
     def _clip_qk(self) -> None:
         threshold = self.config.optimizer["qk_clip_threshold"]
-        for module in self.model.hf_model.modules():
+        self.last_max_logits = {}
+        for name, module in self.model.hf_model.named_modules():
             if not isinstance(module, JTDeepseekV3MLAAttention):
                 continue
             maximum = module.max_logits_val
+            self.last_max_logits[name] = maximum.detach().amax()
             scale = torch.where(maximum >= threshold, threshold / maximum.clamp_min(threshold),
                                 torch.ones_like(maximum))
             cfg = self.config

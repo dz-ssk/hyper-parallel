@@ -94,6 +94,24 @@ class JTAlignmentOptimizer(torch.optim.Optimizer):
             group["lr"] = rate
         return rate
 
+    def get_logging_metrics(self) -> dict[str, torch.Tensor]:
+        """Consume pre-reset QK-clip maxima, reducing head shards over the TP group.
+
+        Values describe this step's attention statistics used by QK clipping,
+        before its accumulator is cleared; they are not vocabulary-head logits.
+        All TP ranks must call this hook, even when only rank zero prints.
+        """
+        snapshots = self.reference_optimizer.last_max_logits
+        if not snapshots:
+            return {}
+        names = sorted(snapshots)
+        values = torch.stack([snapshots[name] for name in names])
+        dist.all_reduce(values, op=dist.ReduceOp.MAX, group=self.parallel.group)
+        self.reference_optimizer.last_max_logits = {}
+        metrics = {f"optimizer/qkclip_maxlogits/{name}": value for name, value in zip(names, values.unbind())}
+        metrics["optimizer/qkclip_maxlogits"] = values.amax()
+        return metrics
+
     def state_dict(self) -> dict:
         """Export optimizer state for the configured checkpoint lifecycle."""
         return {"physical": super().state_dict(), "logical": self.reference_optimizer.state_dict(),

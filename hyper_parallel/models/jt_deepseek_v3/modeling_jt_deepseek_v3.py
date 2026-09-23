@@ -744,6 +744,11 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
             output_norm_factory=lambda size: JTDeepseekV3RMSNorm(size, eps=config.rms_norm_eps),
         )
         self.loss_group = None
+        self._step_loss_metrics = None
+        self._metric_micro_batches = 0
+        # The monitoring denominator counts trunk MoE layers, excluding MTP.
+        moe_layers = sum(isinstance(layer.mlp, JTDeepseekV3MoE) for layer in self.model.layers)
+        self._aux_loss_monitor_scale = moe_layers * self.reference_config["moe_aux_loss_coeff"]
         self.post_init()
 
     def forward(self, input_ids: torch.Tensor, labels: torch.Tensor,
@@ -760,7 +765,30 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
             raise ValueError("JT does not support cached decoding")
         with torch.autocast(input_ids.device.type, dtype=torch.bfloat16, cache_enabled=False):
             losses = self.compute_jt_losses(input_ids, labels, loss_mask)
+        metrics = torch.stack([losses[name].detach() for name in ("lm_loss", "mtp_loss", "aux_loss")])
+        self._step_loss_metrics = metrics if self._step_loss_metrics is None else self._step_loss_metrics + metrics
+        self._metric_micro_batches += 1
         return CausalLMOutputWithPast(loss=losses["loss"])
+
+    def get_logging_metrics(self) -> dict[str, torch.Tensor]:
+        """Consume detached per-microbatch mean losses for the current TP-replicated JT objective.
+
+        MTP and auxiliary values include their configured coefficients. The
+        load-balancing monitor removes the coefficient times trunk MoE count.
+        Its denominator intentionally excludes MTP, matching the JT callback.
+        This is
+        observation only: the combined objective remains the sole backward loss.
+        The supported JT recipe has DP1/CP1 and one microbatch per optimizer step.
+        """
+        if self._step_loss_metrics is None:
+            return {}
+        values = self._step_loss_metrics / self._metric_micro_batches
+        self._step_loss_metrics = None
+        self._metric_micro_batches = 0
+        metrics = dict(zip(("training/lm_loss", "training/mtp_loss", "training/aux_loss"), values.unbind()))
+        metrics["training/load_balancing_loss"] = (
+            values[2] / self._aux_loss_monitor_scale if self._aux_loss_monitor_scale > 0 else values[2].new_zeros(()))
+        return metrics
 
     def compute_jt_losses(self, input_ids: torch.Tensor, labels: torch.Tensor,
                            loss_mask: torch.Tensor) -> dict[str, torch.Tensor]:
