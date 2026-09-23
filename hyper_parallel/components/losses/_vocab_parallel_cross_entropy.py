@@ -398,11 +398,9 @@ class DistributedCrossEntropyFunction(torch.autograd.Function):
                 return torch.tensor(float('nan'), dtype=loss.dtype, device=loss.device)
             return loss / total_weight
         if reduction == "none":
-            # Per-token values belong to one logical loss, just like sum/mean.
-            # Reduce inside this Function so backward differentiates the local
-            # vocabulary slice once, without summing replicated upstream gradients.
-            group = mesh.get_group(mesh_dim)
-            return _differentiable_all_reduce(loss, op="sum", group=group)
+            # Sum per-token values inside this Function so replicated upstream
+            # gradients differentiate each local vocabulary slice only once.
+            return _differentiable_all_reduce(loss, op="sum", group=mesh.get_group(mesh_dim))
         return loss
 
     @staticmethod
