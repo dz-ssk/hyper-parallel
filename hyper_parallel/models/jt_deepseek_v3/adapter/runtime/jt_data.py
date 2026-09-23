@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Pretokenized SFT archives with explicit, already-shifted labels and masks."""
+"""Pretokenized JT archives with explicit, already-shifted labels and masks."""
 
 # This adapter uses the Torch/HF runtime, like the existing model and Trainer modules.
 # pylint: disable=forbidden-backend-import
@@ -27,7 +27,7 @@ import torch
 from torch.utils.data import Dataset
 
 
-class NpzSFTDataset(Dataset):
+class NpzJTDataset(Dataset):
     """Load an offline token archive without tokenization, packing or label shifting."""
 
     def __init__(self, data_path: str | Path) -> None:
@@ -42,7 +42,7 @@ class NpzSFTDataset(Dataset):
         if any(len(shape) != 2 or shape != shapes[0] for shape in shapes):
             raise ValueError("input_ids, pre-shifted labels and loss_mask require matching [samples, tokens] shapes")
         if not shapes[0][0] or not shapes[0][1]:
-            raise ValueError("SFT archive must not be empty")
+            raise ValueError("JT archive must not be empty")
         if any(not np.issubdtype(self.arrays[key].dtype, np.integer) for key in ("input_ids", "labels")):
             raise ValueError("input_ids and labels must be integers")
         mask = self.arrays["loss_mask"]
@@ -63,7 +63,7 @@ class NpzSFTDataset(Dataset):
             torch.float32 if key == "loss_mask" else torch.int64) for key, value in self.arrays.items()}
 
 
-class PreShiftedSFTBatch:
+class PreShiftedJTBatch:
     """Keep precomputed labels/masks intact for a CP1/PP1 Trainer recipe.
 
     FixedBatchDataLoader's DP sampler selects identical sample IDs within each
@@ -79,7 +79,7 @@ class PreShiftedSFTBatch:
             device: Destination device.
         """
         if mesh_context.cp_size != 1 or mesh_context.pp_size != 1:
-            raise ValueError("PreShiftedSFTBatch requires CP1 and PP1")
+            raise ValueError("PreShiftedJTBatch requires CP1 and PP1")
         self.device = device
 
     def __call__(self, data_iterator: Any) -> tuple[dict, dict]:

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Reference document validation and HF configuration for the SFT model."""
+"""Reference document validation and HF configuration for the JT model."""
 
 from __future__ import annotations
 
@@ -23,8 +23,18 @@ import yaml
 from transformers import DeepseekV32Config
 
 
+class JTDeepseekV3Config(DeepseekV32Config):
+    """Keep HF configuration fields with an independently discoverable family identity."""
+
+    model_type = "jt_deepseek_v3"
+
+
 def load_reference(path: str | Path) -> dict[str, Any]:
-    """Read and validate the PR946 reference topology and compute policy."""
+    """Read and validate the reference topology and compute policy.
+
+    Args:
+        path: Reference YAML path.
+    """
     with Path(path).open(encoding="utf-8") as source:
         document = yaml.safe_load(source)
     model = document["model"]["model_config"]
@@ -69,7 +79,11 @@ def load_reference(path: str | Path) -> dict[str, Any]:
 
 
 def make_hf_config(document: dict[str, Any]) -> DeepseekV32Config:
-    """Map every reference model dimension without taking HF defaults."""
+    """Map every reference model dimension without taking HF defaults.
+
+    Args:
+        document: Validated reference configuration.
+    """
     reference = document["model"]["model_config"]
     names = (
         "vocab_size", "hidden_size", "intermediate_size", "moe_intermediate_size",
@@ -79,7 +93,7 @@ def make_hf_config(document: dict[str, Any]) -> DeepseekV32Config:
         "norm_topk_prob", "hidden_act", "max_position_embeddings", "initializer_range",
         "rms_norm_eps", "first_k_dense_replace", "attention_dropout",
     )
-    config = DeepseekV32Config(
+    config = JTDeepseekV3Config(
         **{name: reference[name] for name in names},
         num_key_value_heads=reference["num_attention_heads"],
         rope_parameters={"rope_type": "default", "rope_theta": reference["rope_theta"]},
@@ -89,10 +103,10 @@ def make_hf_config(document: dict[str, Any]) -> DeepseekV32Config:
         mlp_bias=False,
         layer_types=["full_attention"] * reference["num_hidden_layers"],
     )
-    config.architectures = ["DeepseekV32SFTForCausalLM"]
-    config.sft_config = dict(reference)
+    config.architectures = ["JTDeepseekV3ForCausalLM"]
+    config.jt_config = dict(reference)
     config.rope_interleave = True
     return config
 
 
-__all__ = ["load_reference", "make_hf_config"]
+__all__ = ["JTDeepseekV3Config", "load_reference", "make_hf_config"]

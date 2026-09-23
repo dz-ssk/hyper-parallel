@@ -13,7 +13,6 @@
 # limitations under the License.
 # ============================================================================
 """Multi-head latent attention module using the Hyper projection layout."""
-# 算法实现以 co-worker 的修改为准；rebase 时保留其算法语义，我们仅负责框架接入与引用。
 
 from __future__ import annotations
 
@@ -284,7 +283,7 @@ class MLAAttention(nn.Module):
             hidden_states: Input hidden states.
             position_embeddings: Explicit cosine and sine frequencies.
             attention_mask: Optional attention mask.
-            past_key_values: Cache state; unsupported for SFT.
+            past_key_values: Cache state; unsupported for JT.
             actual_seq_len: Actual seq len.
         """
         batch_size, seq_length = hidden_states.shape[:-1]
