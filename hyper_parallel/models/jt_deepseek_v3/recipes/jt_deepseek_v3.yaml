@@ -1,5 +1,5 @@
 # Run the configured JT model through the standard Trainer training loop.
-# Model fields are native HF/JT options; exported weights are configured separately.
+# Model fields are native HF/JT options; reference weights are converted offline.
 model:
   _target_: hyper_parallel.models.jt_deepseek_v3.adapter.jt_builder.build_jt_model
   config:
@@ -44,8 +44,7 @@ model:
     moe_aux_loss_coeff: 0.0001
     moe_router_enable_expert_bias: true
     moe_router_bias_update_rate: 0.001
-  source_tp_size: 8
-  reference_weights: /path/to/initial_weights
+  reference_weights: /path/to/jt_initial_weights
 loss_fn:
   _target_: hyper_parallel.components.losses.ModelOutputLoss
   pass_loss_inputs: true

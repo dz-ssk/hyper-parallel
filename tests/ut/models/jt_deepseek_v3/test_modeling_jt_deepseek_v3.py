@@ -31,6 +31,7 @@ from hyper_parallel.components.modules.mtp import DeepseekV3MTPExecution, MultiT
 from hyper_parallel.models.jt_deepseek_v3.adapter.conversion.jt_mtp import JTDeepseekV3MTPExecution
 from hyper_parallel.models.replacement import compile_module_replacements, apply_module_replacements
 from hyper_parallel.models.jt_deepseek_v3.adapter.jt_builder import _load_reference_state
+from hyper_parallel.models.jt_deepseek_v3.adapter.conversion.checkpoint_mapping import _fuse_mla_projections
 from hyper_parallel.models.registry import get_model_adapter
 from hyper_parallel.trainer.config import entries_to_module_replacements
 from hyper_parallel.trainer.config.manager import parse_training_args
@@ -141,7 +142,7 @@ class TestCompleteModel(unittest.TestCase):
     def test_meta_replacement_loads_complete_reference_state(self):
         """Feature: Checkpoint conversion.
 
-        Description: Materialize the recipe-selected model and load every original tensor.
+        Description: Convert projection layout offline, then load the materialized recipe model.
         Expectation: Fused projections round-trip and every loaded parameter is exact.
         """
         config = small_config()
@@ -155,7 +156,8 @@ class TestCompleteModel(unittest.TestCase):
             plan = compile_module_replacements(candidate, rules)
             apply_module_replacements(candidate, plan, weights_mapping=[])
         candidate.to_empty(device="cpu")
-        loaded, groups = _load_reference_state(candidate, arrays)
+        groups = _fuse_mla_projections(arrays)
+        loaded = _load_reference_state(candidate, arrays)
         self.assertEqual(len(groups), 3)
         self.assertEqual(set(loaded), set(arrays))
         for group in groups:
