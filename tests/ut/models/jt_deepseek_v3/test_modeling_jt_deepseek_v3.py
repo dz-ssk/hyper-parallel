@@ -75,6 +75,13 @@ class TestCompleteModel(unittest.TestCase):
         tokens = torch.arange(8).unsqueeze(0)
         output = model(tokens, (tokens + 1) % 32, torch.ones(1, 8))
         self.assertTrue(torch.isfinite(output.loss))
+        metrics = model.get_logging_metrics()
+        self.assertEqual(set(metrics), {"training/lm_loss", "training/mtp_loss", "training/aux_loss",
+                                       "training/load_balancing_loss"})
+        combined = (metrics["training/lm_loss"] + metrics["training/aux_loss"]) + metrics["training/mtp_loss"]
+        self.assertTrue(torch.equal(output.loss.detach(), combined))
+        self.assertTrue(all(not value.requires_grad for value in metrics.values()))
+        self.assertEqual(model.get_logging_metrics(), {})
         output.loss.backward()
         for name in ["model.embed_tokens.weight", "model.layers.1.mlp.gate.weight", "mtp.layers.0.eh_proj.weight"]:
             gradient = dict(model.named_parameters())[name].grad
@@ -171,3 +178,24 @@ class TestCompleteModel(unittest.TestCase):
         self.assertEqual(standard.architecture, "DeepseekV3ForCausalLM")
         self.assertEqual(custom.model_type, "jt_deepseek_v3")
         self.assertEqual(small_config().to_dict()["model_type"], "jt_deepseek_v3")
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_aux_monitor_uses_trunk_moe_count_and_handles_zero_scale(self):
+        """Feature: JT monitoring semantics.
+
+        Description: Use two trunk routers and a separate MTP router, then disable auxiliary loss.
+        Expectation: The monitor averages by two trunk layers; zero scale produces a finite zero.
+        """
+        config = small_config()
+        config.mlp_layer_types = ["sparse", "sparse"]
+        model = JTDeepseekV3ForCausalLM(config)
+        model._step_loss_metrics = torch.tensor([2.0, 0.3, 0.06])
+        model._metric_micro_batches = 1
+        metrics = model.get_logging_metrics()
+        torch.testing.assert_close(metrics["training/load_balancing_loss"], torch.tensor(3.0))
+        self.assertEqual(model.get_logging_metrics(), {})
+        config.jt_config["moe_aux_loss_coeff"] = 0.0
+        model = JTDeepseekV3ForCausalLM(config)
+        model._step_loss_metrics = torch.tensor([2.0, 0.3, 0.0])
+        model._metric_micro_batches = 1
+        self.assertEqual(model.get_logging_metrics()["training/load_balancing_loss"].item(), 0.0)
