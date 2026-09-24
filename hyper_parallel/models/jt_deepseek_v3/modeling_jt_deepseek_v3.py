@@ -45,6 +45,7 @@ from hyper_parallel.components.functional.npu_grouped_swiglu import npu_grouped_
 from hyper_parallel.components.losses._vocab_parallel_cross_entropy import vocab_parallel_cross_entropy_local
 from hyper_parallel.core.tensor_parallel.loss_parallel import _get_loss_parallel_mesh
 from hyper_parallel.models.replacement import module_replacement
+from hyper_parallel.distributed.expert_parallel.routing import MOE_ROUTER_ADAPTERS
 
 
 class JTDeepseekV3RMSNorm(DeepseekV32RMSNorm):
@@ -363,58 +364,18 @@ class ExpertCombine(torch.autograd.Function):
         return value_gradient, probability_gradient, None
 
 
-class RoutingProbabilities(torch.autograd.Function):
-    """Keep main and auxiliary router gradients in the reference accumulation order."""
+class JTDeepseekV3Gate(DeepseekV32TopkRouter):
+    """Expose HF gate logits to the public router and the model's auxiliary loss."""
 
-    @staticmethod
-    def forward(ctx: Any, logits: torch.Tensor, indices: torch.Tensor, frequency: torch.Tensor,
-                scale: float, alpha: float, normalize: bool) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compute selected probabilities and the local sequence balancing loss.
+    def __init__(self, config: Any) -> None:
+        """Keep the HF parameters and bias without duplicating its top-k computation."""
+        super().__init__(config)
+        self.router_logits = None
 
-        Args:
-            ctx: Autograd context.
-            logits: Local logits.
-            indices: Selected expert indices.
-            frequency: Normalized expert frequency.
-            scale: Selected probability scaling factor.
-            alpha: Auxiliary loss coefficient.
-            normalize: Whether to normalize selected probabilities.
-        """
-        scores = logits.sigmoid()
-        ctx.save_for_backward(scores, indices, frequency)
-        ctx.scale, ctx.alpha, ctx.normalize = scale, alpha, normalize
-        selected = scores.gather(-1, indices)
-        if normalize:
-            selected = selected / (selected.sum(-1, keepdim=True) + 1e-20)
-        normalized = scores / (scores.sum(-1, keepdim=True) + 1e-20)
-        auxiliary = (normalized.mean(0) * frequency).sum() * scores.shape[-1] * alpha
-        return selected * scale, auxiliary
-
-    @staticmethod
-    def backward(ctx: Any, gradient: torch.Tensor, auxiliary_gradient: torch.Tensor) -> tuple:
-        """Add the auxiliary denominator and numerator terms after the selected path.
-
-        Args:
-            ctx: Autograd context.
-            gradient: Upstream gradient.
-            auxiliary_gradient: Upstream auxiliary loss gradient.
-        """
-        scores, indices, frequency = ctx.saved_tensors
-        scaled = gradient * ctx.scale
-        if ctx.normalize:
-            selected = scores.gather(-1, indices)
-            denominator = selected.sum(-1, keepdim=True) + 1e-20
-            partial = scaled / denominator + (
-                -scaled * ((selected / denominator) / denominator)).sum(-1, keepdim=True)
-        else:
-            partial = scaled
-        main = torch.zeros_like(scores).scatter(-1, indices, partial)
-        auxiliary = (frequency * (auxiliary_gradient * (ctx.alpha * scores.shape[-1]))) / scores.shape[0]
-        denominator = scores.sum(-1, keepdim=True) + 1e-20
-        direct = auxiliary / denominator
-        negative = (-auxiliary * ((scores / denominator) / denominator)).sum(-1, keepdim=True)
-        total = (main + negative) + direct
-        return (1 - scores) * (scores * total), None, None, None, None, None
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Project once; retain full logits until the caller constructs auxiliary loss."""
+        self.router_logits = F.linear(hidden_states.reshape(-1, self.hidden_dim).float(), self.weight.float())
+        return self.router_logits
 
 
 class JTDeepseekV3MoE(DeepseekV32MoE):
@@ -427,7 +388,7 @@ class JTDeepseekV3MoE(DeepseekV32MoE):
         self.reference_is_mtp = is_mtp
         self.padding = config.n_routed_experts if config.use_pad_tokens else 0
         self.experts = JTDeepseekV3Experts(config)
-        self.gate = DeepseekV32TopkRouter(config)
+        self.gate = JTDeepseekV3Gate(config)
         self.shared_experts = JTDeepseekV3MLP(
             config, intermediate_size=config.moe_intermediate_size * config.n_shared_experts,
             rounded_up_gradient=is_mtp)
@@ -446,20 +407,17 @@ class JTDeepseekV3MoE(DeepseekV32MoE):
         config = self.config
         hidden = hidden[:, padding:]
         with torch.autocast(hidden.device.type, enabled=False):
-            logits = F.linear(hidden.reshape(-1, hidden.shape[-1]).float(), self.gate.weight)
-            scores = logits.sigmoid()
-            selection = scores + self.gate.e_score_correction_bias
-            indices = selection.topk(config.num_experts_per_tok, dim=-1).indices
+            indices, selected = MOE_ROUTER_ADAPTERS["deepseekv3"](self, hidden)
+            scores = self.gate.router_logits.sigmoid()
+            self.gate.router_logits = None
             frequency = torch.bincount(indices.flatten(), minlength=config.n_routed_experts).float()
             frequency = frequency / indices.numel()
             if group is not None:
                 dist.all_reduce(frequency, group=group)
             frequency = frequency / world
             self.expert_load = frequency.detach()
-            selected, auxiliary = RoutingProbabilities.apply(
-                logits, indices, frequency, config.routed_scaling_factor, config.moe_aux_loss_coeff,
-                config.norm_topk_prob and config.num_experts_per_tok > 1)
-            self.auxiliary_loss = auxiliary
+            normalized = scores / (scores.sum(-1, keepdim=True) + 1e-20)
+            self.auxiliary_loss = (normalized.mean(0) * frequency).sum() * scores.shape[-1] * config.moe_aux_loss_coeff
         if padding:
             pad_ids = torch.arange(padding * config.num_experts_per_tok, device=indices.device)
             pad_ids = pad_ids.reshape(padding, config.num_experts_per_tok) % padding
