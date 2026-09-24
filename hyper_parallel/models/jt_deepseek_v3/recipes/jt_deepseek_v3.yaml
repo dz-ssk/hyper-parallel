@@ -138,7 +138,7 @@ activation_checkpoint:
   mode: "off"
 activation_swap: none
 dataset:
-  _target_: hyper_parallel.data.indexed.supervised_dataset.IndexedSupervisedDataset
+  _target_: hyper_parallel.models.jt_deepseek_v3.adapter.runtime.jt_data.IndexedSupervisedDataset
   data_path: /path/to/supervised_prefix
   sequence_length: 262144
   model_assets:
