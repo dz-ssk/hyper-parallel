@@ -158,7 +158,7 @@ dataloader:
   drop_last: true
   num_workers: 0
 optimizer:
-  _target_: hyper_parallel.models.jt_deepseek_v3.adapter.runtime.muon_adapter.build_optimizer
+  _target_: hyper_parallel.models.jt_deepseek_v3.adapter.runtime.jt_optimizer.build_optimizer
   muon_config:
     lr: 2.4e-5
     weight_decay: 0.1

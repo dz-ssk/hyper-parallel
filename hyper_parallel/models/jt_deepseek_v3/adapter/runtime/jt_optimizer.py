@@ -12,11 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Post-update QK clipping for JT MLA projections."""
+"""JT model hooks around the public Muon optimizer."""
+
+import math
+from functools import partial
+from typing import Any
 
 import torch
 import torch.distributed as dist
 
+from hyper_parallel.components.optim.builders import Muon
 from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import JTDeepseekV3MLAAttention
 
 
@@ -47,3 +52,67 @@ def clip_qk(model: torch.nn.Module, threshold: float) -> dict[str, torch.Tensor]
     if metrics:
         metrics["optimizer/qkclip_maxlogits"] = torch.stack(list(metrics.values())).amax()
     return metrics
+
+
+def reshape_gate_up_projection(parameter_name: str, update: torch.Tensor) -> list[torch.Tensor]:
+    """Expose fused Gate/Up projections as independent logical Muon matrices.
+
+    The model stores Gate and Up together for the grouped expert kernel. Muon
+    receives two transposed views so it normalizes and orthogonalizes each
+    projection independently while writing updates into the same storage.
+
+    Args:
+        parameter_name: Fully qualified parameter name assigned by the optimizer.
+        update: Local Muon update matrix for one parameter.
+
+    Returns:
+        The logical matrices to be processed by the public Muon implementation.
+    """
+    if parameter_name.endswith("experts.gate_up_proj"):
+        return [projection.mT for projection in update.chunk(2, dim=1)]
+    return [update]
+
+
+@torch.no_grad()
+def _after_update(model: torch.nn.Module, threshold: float, optimizer: Any, args: tuple, kwargs: dict) -> None:
+    """Apply model-owned updates after all public optimizer leaves complete."""
+    del optimizer, args, kwargs
+    model.jt_optimizer_metrics = clip_qk(model, threshold)
+    config = model.config
+    if config.moe_router_enable_expert_bias:
+        for module in model.modules():
+            if getattr(module, "expert_load", None) is not None:
+                direction = (1 / config.n_routed_experts - module.expert_load).sign()
+                module.gate.e_score_correction_bias.add_(direction, alpha=config.moe_router_bias_update_rate)
+                module.expert_load.zero_()
+
+
+def _take_metrics(model: torch.nn.Module) -> dict[str, torch.Tensor]:
+    """Return QK clipping metrics collected after the previous optimizer step."""
+    result = model.jt_optimizer_metrics
+    model.jt_optimizer_metrics = {}
+    return result
+
+
+def build_optimizer(*, model: torch.nn.Module, qk_clip_threshold: float, **kwargs: Any) -> Muon:
+    """Build public Muon/AdamW and attach the JT-specific post-update hooks.
+
+    Args:
+        model: Model whose final FSDP parameter layouts are already prepared.
+        qk_clip_threshold: Positive clipping threshold for QK projections.
+        **kwargs: Public Muon Builder options from the training recipe.
+
+    Returns:
+        The unmodified public Muon Builder.
+    """
+    if not math.isfinite(qk_clip_threshold) or qk_clip_threshold <= 0:
+        raise ValueError("qk_clip_threshold must be finite and positive")
+    muon_config = {**kwargs["muon_config"], "reshape_fn": reshape_gate_up_projection}
+    builder = Muon(model=model, muon_config=muon_config, **{
+        name: value for name, value in kwargs.items() if name != "muon_config"
+    })
+    optimizer = builder.get_optimizer()
+    optimizer.chained_optimizers[-1].register_step_post_hook(partial(_after_update, model, qk_clip_threshold))
+    model.jt_optimizer_metrics = {}
+    optimizer.get_logging_metrics = partial(_take_metrics, model)
+    return builder
