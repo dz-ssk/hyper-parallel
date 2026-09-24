@@ -23,7 +23,6 @@ import torch
 import torch.distributed as dist
 
 from hyper_parallel.distributed.expert_parallel.recipes import build_ep_compute
-from hyper_parallel.distributed.expert_parallel.experts import EPDispatchPolicy
 from hyper_parallel.distributed.recipe_spec import local_compute
 
 
@@ -86,8 +85,6 @@ def jt_deepseek_v3_ep_compute(*, module: Any, mesh: Any, tp_mesh: Any, cp_mesh: 
     executor = build_ep_compute(
         module, ep_mesh, router_fn=route_with_auxiliary_reduction, archetype_key="jt_deepseek_v3_hf",
         expected_attrs=["gate", "experts", "shared_experts", "config"],
-        combine=module.combine_routed, use_grouped_gemm=True,
-        dispatch_policy=EPDispatchPolicy(torch.bfloat16, torch.float32, True),
-        aggregate_fn=module.aggregate_experts)
+        combine=module.combine_routed, use_grouped_gemm=True)
     module.ep_compute = partial(executor, module)
     return type(module).forward

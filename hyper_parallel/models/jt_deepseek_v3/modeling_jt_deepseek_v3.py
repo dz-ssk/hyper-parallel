@@ -467,24 +467,6 @@ class JTDeepseekV3MoE(DeepseekV32MoE):
             selected = torch.cat((selected.new_zeros(padding, selected.shape[-1]), selected))
         return indices, selected
 
-    def aggregate_experts(self, outputs: torch.Tensor, weights: torch.Tensor, sources: torch.Tensor,
-                          order: torch.Tensor, shape: tuple) -> torch.Tensor:
-        """Accumulate top-k expert outputs in the reference order.
-
-        Args:
-            outputs: Outputs.
-            weights: Weights.
-            sources: Sources.
-            order: Order.
-            shape: Shape.
-        """
-        del sources
-        token_count = shape[0] * shape[1]
-        values = outputs[order.argsort()].reshape(-1, token_count, shape[-1]).transpose(0, 1)
-        probabilities = weights.reshape(-1, token_count).T
-        result = ExpertCombine.apply(values, probabilities, self.reference_is_mtp)
-        return result.reshape(shape)
-
     def local_routed_forward(self, hidden: torch.Tensor) -> torch.Tensor:
         """Execute the same router and ordered combine without distributed setup.
 
