@@ -26,10 +26,12 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch_npu
 from transformers import DeepseekV32Config, PreTrainedModel
 
 from hyper_parallel.components.checkpoint.weight_conversion import get_model_conversion_mapping
 from hyper_parallel.distributed.recipe_spec import ModuleShardingSpec
+from hyper_parallel.models.build_options import FSDP2Config
 from hyper_parallel.models._transformers.model_builder import (
     _build_replacement_context,
     apply_model_infrastructure,
@@ -151,6 +153,8 @@ def build_jt_model(*, config: dict[str, Any], reference_weights: str | Path, sou
         raise ValueError("JT precision requires FP32 master parameters")
     infrastructure_options["model_init_dtype"] = "float32"
 
+    torch_npu.npu.set_compile_mode(jit_compile=False)
+    torch.use_deterministic_algorithms(True)
     config = DeepseekV32Config(**config)
     arrays, _, conversion = convert_reference(reference_weights, config, source_tp_size=source_tp_size)
     setup = _with_model_ep_overrides(distributed_setup, config)
@@ -174,14 +178,16 @@ def build_jt_model(*, config: dict[str, Any], reference_weights: str | Path, sou
 
     expected, logical_groups = _load_reference_state(model, arrays)
 
-    framework_setup = replace(setup, module_replacements=())
+    # Source-layout FSDP owns parameters and gradient synchronization even at DP1.
+    framework_setup = replace(
+        setup, module_replacements=(), strategy_config=setup.strategy_config or FSDP2Config(),
+    )
 
     # Replacements have already shaped the reference state, so do not apply them a second time.
     planner, fsdp = instantiate_infrastructure(distributed_setup=framework_setup)
     device = torch.device(mesh.device_mesh.device_type, torch.distributed.get_rank() % mesh.tp_size)
     model.to(device)
     model.loss_group = mesh.device_mesh["tp"].get_group()
-    global_shapes = {name: tuple(value.shape) for name, value in model.named_parameters()}
     model = apply_model_infrastructure(
         model,
         mesh=mesh,
@@ -192,9 +198,6 @@ def build_jt_model(*, config: dict[str, Any], reference_weights: str | Path, sou
         is_meta_device=False,
         is_hf_model=True,
         **infrastructure_options,
-    )
-    model.jt_replicated_names = tuple(
-        name for name, value in model.named_parameters() if tuple(value.shape) == global_shapes[name]
     )
     model.build_report = {
         **conversion,
