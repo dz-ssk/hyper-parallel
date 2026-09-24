@@ -503,8 +503,6 @@ def apply_model_infrastructure(
         validate_placement,
     )
 
-    model.source_shard_info = source_shard_info
-
     model = _apply_activation_features(
         model,
         activation_checkpoint,

@@ -157,7 +157,7 @@ dataloader:
   drop_last: true
   num_workers: 0
 optimizer:
-  _target_: hyper_parallel.components.optim.builders.Muon
+  _target_: hyper_parallel.models.jt_deepseek_v3.adapter.runtime.jt_optimizer.build_optimizer
   muon_config:
     lr: 2.4e-5
     weight_decay: 0.1
@@ -172,9 +172,7 @@ optimizer:
     adamw_weight_decay: 0.1
     adamw_betas: [0.9, 0.95]
     adamw_eps: 1.0e-8
-  adapter:
-    _target_: hyper_parallel.models.jt_deepseek_v3.adapter.runtime.muon_adapter.optimizer_adapter
-    qk_clip_threshold: 100.0
+  qk_clip_threshold: 100.0
 lr_scheduler:
   _target_: hyper_parallel.components.optim.lr_scheduler.MultiLRScheduler
   lr_decay_style: cosine
