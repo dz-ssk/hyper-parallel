@@ -150,7 +150,7 @@ def build_jt_model(*, config: dict[str, Any], reference_weights: str | Path,
     # Rotary buffers are nonpersistent; restore their deterministic reference state after to_empty().
     model.model.rotary_emb = type(model.model.rotary_emb)(config)
 
-    expected, logical_groups = _load_reference_state(model, arrays)
+    expected = _load_reference_state(model, arrays)
 
     # Source-layout FSDP owns parameters and gradient synchronization even at DP1.
     framework_setup = replace(
