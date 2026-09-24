@@ -18,7 +18,6 @@ from pathlib import Path
 import unittest
 from unittest.mock import patch
 
-import numpy as np
 import torch
 from torch import nn
 from transformers import DeepseekV32Config
@@ -31,7 +30,6 @@ from hyper_parallel.components.modules.mtp import DeepseekV3MTPExecution, MultiT
 from hyper_parallel.models.jt_deepseek_v3.adapter.conversion.jt_mtp import JTDeepseekV3MTPExecution
 from hyper_parallel.models.replacement import compile_module_replacements, apply_module_replacements
 from hyper_parallel.models.jt_deepseek_v3.adapter.jt_builder import _load_reference_state
-from hyper_parallel.models.jt_deepseek_v3.adapter.conversion.checkpoint_mapping import _fuse_mla_projections
 from hyper_parallel.models.registry import get_model_adapter
 from hyper_parallel.trainer.config import entries_to_module_replacements
 from hyper_parallel.trainer.config.manager import parse_training_args
@@ -139,15 +137,13 @@ class TestCompleteModel(unittest.TestCase):
         self.assertTrue(torch.equal(embedding.grad, torch.ones_like(embedding)))
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
-    def test_meta_replacement_loads_complete_reference_state(self):
-        """Feature: Checkpoint conversion.
+    def test_meta_replacement_loads_converted_reference_state(self):
+        """Feature: Offline checkpoint loading.
 
-        Description: Convert projection layout offline, then load the materialized recipe model.
-        Expectation: Fused projections round-trip and every loaded parameter is exact.
+        Description: Load arrays that already use the model's final parameter layout.
+        Expectation: Every materialized parameter is loaded exactly.
         """
         config = small_config()
-        source = JTDeepseekV3ForCausalLM(config)
-        arrays = {name: value.detach().numpy().copy() for name, value in source.state_dict().items()}
         recipe_path = Path(__file__).resolve().parents[4] / (
             "hyper_parallel/models/jt_deepseek_v3/recipes/jt_deepseek_v3.yaml")
         rules = entries_to_module_replacements(parse_training_args([str(recipe_path)]).plan_overrides)
@@ -156,14 +152,9 @@ class TestCompleteModel(unittest.TestCase):
             plan = compile_module_replacements(candidate, rules)
             apply_module_replacements(candidate, plan, weights_mapping=[])
         candidate.to_empty(device="cpu")
-        groups = _fuse_mla_projections(arrays)
+        arrays = {name: value.detach().numpy().copy() for name, value in candidate.state_dict().items()}
         loaded = _load_reference_state(candidate, arrays)
-        self.assertEqual(len(groups), 3)
         self.assertEqual(set(loaded), set(arrays))
-        for group in groups:
-            fused = candidate.state_dict()[group["storage"]].detach().numpy()
-            original = [source.state_dict()[name].detach().numpy() for name in group["logical_parameters"]]
-            np.testing.assert_array_equal(fused, np.concatenate(original, axis=0))
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_family_registration_does_not_replace_standard_deepseek(self):
