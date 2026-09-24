@@ -364,6 +364,33 @@ class ExpertCombine(torch.autograd.Function):
         return value_gradient, probability_gradient, None
 
 
+class _ModelParallelMean(torch.autograd.Function):
+    """Replicate one global mean while differentiating each local contribution once."""
+
+    @staticmethod
+    def forward(ctx: Any, value: torch.Tensor, group: Any) -> torch.Tensor:
+        """Average equally weighted contributions across the model-parallel group."""
+        ctx.world_size = dist.get_world_size(group)
+        result = value.clone()
+        dist.all_reduce(result, op=dist.ReduceOp.SUM, group=group)
+        return result / ctx.world_size
+
+    @staticmethod
+    def backward(ctx: Any, gradient: torch.Tensor) -> tuple[torch.Tensor, None]:
+        """Scale the local derivative without summing identical output replicas."""
+        return gradient / ctx.world_size, None
+
+
+def _model_parallel_mean(value: torch.Tensor, group: Any = None) -> torch.Tensor:
+    """Reduce a partitioned objective; absent an explicit group, keep it local.
+
+    Contributions must be equally weighted, with the same upstream derivative
+    on all ranks. This does not implement DDP averaging or independently
+    consumed all-reduce outputs; uneven token partitions need explicit weights.
+    """
+    return value if group is None else _ModelParallelMean.apply(value, group)
+
+
 class JTDeepseekV3Gate(DeepseekV32TopkRouter):
     """Expose HF gate logits to the public router and the model's auxiliary loss."""
 
@@ -418,6 +445,7 @@ class JTDeepseekV3MoE(DeepseekV32MoE):
             self.expert_load = frequency.detach()
             normalized = scores / (scores.sum(-1, keepdim=True) + 1e-20)
             self.auxiliary_loss = (normalized.mean(0) * frequency).sum() * scores.shape[-1] * config.moe_aux_loss_coeff
+            self.auxiliary_loss = _model_parallel_mean(self.auxiliary_loss, group)
         if padding:
             pad_ids = torch.arange(padding * config.num_experts_per_tok, device=indices.device)
             pad_ids = pad_ids.reshape(padding, config.num_experts_per_tok) % padding

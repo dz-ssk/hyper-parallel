@@ -113,7 +113,7 @@ plan_overrides:
     when: ep
     region_dispatch: false
     local_compute_fn:
-      _target_: hyper_parallel.models.jt_deepseek_v3.adapter.distributed.jt_expert_parallel.jt_deepseek_v3_ep_compute
+      _target_: hyper_parallel.models.jt_deepseek_v3.adapter.jt_builder.build_jt_ep
 training:
   train_iters: 10
   lr_scheduler_iters: 8

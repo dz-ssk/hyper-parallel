@@ -19,7 +19,7 @@ from unittest.mock import patch
 
 import torch
 
-from hyper_parallel.models.jt_deepseek_v3.adapter.distributed.jt_expert_parallel import _model_parallel_mean
+from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import _model_parallel_mean
 from tests.common.mark_utils import arg_mark
 
 
