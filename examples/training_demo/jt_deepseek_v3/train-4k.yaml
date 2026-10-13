@@ -152,12 +152,12 @@ training:
   seed: 42
   enable_full_determinism: true
 accelerator:
-  tp_size: 4
-  ep_size: 8
+  tp_size: 1
+  ep_size: 1
   cp_size: 1
   pp_size: 1
-  sequence_parallel: true
-  loss_parallel: true
+  sequence_parallel: false
+  loss_parallel: false
 fsdp_config:
   dp_shard_size: 1
   mix_precision:
