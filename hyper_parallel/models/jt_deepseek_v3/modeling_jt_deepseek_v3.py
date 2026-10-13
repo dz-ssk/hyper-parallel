@@ -88,7 +88,10 @@ class JTDeepseekV3RotaryEmbedding(nn.Module):
     """Rotary position embedding for the interleaved (``rope_interleave``) channel layout."""
 
     def forward(self, values: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-        """De-interleave ``values`` and rotate them by the position angles.
+        """De-interleave ``values`` and rotate them by the position angles in FP32.
+
+        As MindFormers does with ``rotary_dtype: float32``, the channels and tables are upcast to
+        FP32 and the rotated channels are rounded to the dtype of ``values`` once.
 
         Args:
             values: Rotary channels in interleaved order, ``[batch, heads, sequence, rope_dim]``.
@@ -96,12 +99,13 @@ class JTDeepseekV3RotaryEmbedding(nn.Module):
             sin: Sines of the position angles, ``[batch, sequence, rope_dim]``.
 
         Returns:
-            The rotated channels in half-split order.
+            The rotated channels in half-split order, in the dtype of ``values``.
         """
-        ordered = torch.cat((values[..., ::2], values[..., 1::2]), dim=-1)
+        ordered = torch.cat((values[..., ::2], values[..., 1::2]), dim=-1).float()
         first, second = ordered.chunk(2, dim=-1)
         rotated = torch.cat((-second, first), dim=-1)
-        return ordered * cos.unsqueeze(1) + rotated * sin.unsqueeze(1)
+        output = ordered * cos.unsqueeze(1).float() + rotated * sin.unsqueeze(1).float()
+        return output.to(values.dtype)
 
 
 def observed_fusion_attention(module: nn.Module, query: torch.Tensor, key: torch.Tensor,
@@ -750,9 +754,8 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
         frequency = position_ids.to(device=input_ids.device, dtype=torch.float32).unsqueeze(-1) * inverse
         frequency = torch.cat((frequency, frequency), dim=-1)
         hidden = self.model.embed_tokens(input_ids)
-        # Transformers rotary contract: FP32 frequencies, tables returned in the activation dtype.
-        attention_kwargs = {"position_embeddings": (frequency.cos().to(hidden.dtype), frequency.sin().to(hidden.dtype)),
-                            "actual_seq_len": ends}
+        # FP32 tables; JTDeepseekV3RotaryEmbedding rotates in FP32 and rounds to the activation dtype once.
+        attention_kwargs = {"position_embeddings": (frequency.cos(), frequency.sin()), "actual_seq_len": ends}
         auxiliary = torch.zeros((), device=hidden.device, dtype=torch.float32)
         for layer in self.model.layers:
             hidden = layer(hidden, **attention_kwargs)
