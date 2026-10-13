@@ -79,7 +79,9 @@ def mean_global_loss(
 
         if all_reduced_len != 0:
             local_weighted_loss = cur_loss * cur_token_len
-            backward_loss = local_weighted_loss / all_reduced_len * device_mesh.dp_size * device_mesh.cp_size
+            # Form the token weight first so a full single-rank microbatch has an exact identity gradient.
+            backward_scale = cur_token_len / all_reduced_len * device_mesh.dp_size * device_mesh.cp_size
+            backward_loss = cur_loss * backward_scale
             global_weighted_loss = all_reduce(
                 local_weighted_loss.detach().item(),
                 op="sum",
