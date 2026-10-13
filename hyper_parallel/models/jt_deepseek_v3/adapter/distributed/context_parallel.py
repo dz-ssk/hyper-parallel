@@ -59,7 +59,7 @@ def _head_projection_request(projection: nn.Linear, head_dim: int) -> _ForwardRe
 
 def _latent_inputs(module: JTDeepseekV3MLAAttention, runtime: MLAContextParallel,
                    hidden: torch.Tensor, positions: Any) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Retain JT's Norm, shared-key gather and native-dtype rotary operations."""
+    """Retain JT's Norm, shared-key gather and FP32 rotary operations."""
     query_latent, kv_latent, key_rope = module.project_latent_inputs(hidden)
     batch, sequence = query_latent.shape[:2]
     query = module.q_b_proj(query_latent).reshape(batch, sequence, module.num_heads, module.qk_head_dim)

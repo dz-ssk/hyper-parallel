@@ -26,7 +26,7 @@ from torch.nn import functional as F
 from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import (
     JTDeepseekV3Config,
     JTDeepseekV3ForCausalLM, JTDeepseekV3Decoder, JTDeepseekV3Gate, JTDeepseekV3MoE,
-    JTDeepseekV3Attention, JTDeepseekV3MLAAttention,
+    JTDeepseekV3Attention, JTDeepseekV3MLAAttention, JTDeepseekV3RotaryEmbedding,
 )
 from hyper_parallel.components.losses import calculate_seq_aux_loss
 from hyper_parallel.components.modules.mtp import MultiTokenPredictionLayer
@@ -161,6 +161,43 @@ class TestCompleteModel(unittest.TestCase):
                 self.assertEqual(router_scores.dtype, torch.float32)
                 self.assertTrue(torch.equal(router_scores, logits.sigmoid()),
                                 f"{name} auxiliary-loss scores differ from the router logits")
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_standard_policy_bfloat16_rotates_rope_in_fp32(self):
+        """Feature: RoPE precision under the framework BF16 policy.
+
+        Description: Emulate FSDP param_dtype=bfloat16 compute copies; capture every trunk and MTP rotary call.
+        Expectation: The position tables are FP32, and every rotated output equals the FP32 rotation of the
+            BF16 channel pairs rounded to BF16 once, as MindFormers rotates with rotary_dtype=float32.
+        """
+        model = JTDeepseekV3ForCausalLM(small_config())
+        for parameter in model.parameters():
+            parameter.data = parameter.data.to(torch.bfloat16)
+        calls = []
+
+        def capture(_module: Any, inputs: Any, output: torch.Tensor) -> None:
+            """Store the rotary channels, the position tables and the rotated output."""
+            calls.append((*inputs, output))
+
+        handles = [module.register_forward_hook(capture) for module in model.modules()
+                   if isinstance(module, JTDeepseekV3RotaryEmbedding)]
+        try:
+            tokens = torch.arange(8).unsqueeze(0)
+            with torch.no_grad():
+                model(tokens, (tokens + 1) % 32)
+        finally:
+            for handle in handles:
+                handle.remove()
+        # Query and key rotations in both trunk layers and in the MTP layer.
+        self.assertEqual(len(calls), 6)
+        for values, cos, sin, output in calls:
+            self.assertEqual((values.dtype, cos.dtype, sin.dtype, output.dtype),
+                             (torch.bfloat16, torch.float32, torch.float32, torch.bfloat16))
+            even, odd = values[..., ::2].float(), values[..., 1::2].float()
+            half = even.shape[-1]
+            cos, sin = cos[..., :half].unsqueeze(1), sin[..., :half].unsqueeze(1)
+            expected = torch.cat((even * cos - odd * sin, odd * cos + even * sin), dim=-1)
+            self.assertTrue(torch.equal(output, expected.to(torch.bfloat16)))
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_replacement_selects_attention(self):
