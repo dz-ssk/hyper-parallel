@@ -69,10 +69,13 @@ class JTDeepseekV3Output(ModelOutput):
 
 
 class JTDeepseekV3Experts(DeepseekV32Experts):
-    """HF packed experts with the grouped-GEMM entry point of expert parallelism."""
+    """HF packed experts with the expert-major grouped-GEMM entry of both routed paths."""
 
     def forward_expert_major(self, inputs: torch.Tensor, counts: torch.Tensor) -> torch.Tensor:
         """Run the SwiGLU experts on tokens grouped by local expert.
+
+        The single-device routed path and expert parallelism both compute the experts here: two
+        grouped GEMMs around the fused ``npu_swiglu``.
 
         Args:
             inputs: Tokens sorted by local expert, ``[tokens, hidden]``.
@@ -462,7 +465,10 @@ class JTDeepseekV3MoE(DeepseekV32MoE):
     def local_routed_forward(self, hidden: torch.Tensor) -> torch.Tensor:
         """Run the routed experts on this rank without expert parallelism.
 
-        Routing weights are cast to the activation dtype, as in the EP combine.
+        Mirrors the EP pipeline on one rank: tokens are sorted by expert and computed by
+        :meth:`JTDeepseekV3Experts.forward_expert_major`, the routing weights are cast to the
+        activation dtype, and the weighted outputs are summed per token with ``index_add_``. The
+        routed output therefore does not depend on whether expert parallelism is enabled.
 
         Args:
             hidden: Pad-prefixed hidden states, ``[1, padding + tokens, hidden]``.
@@ -472,15 +478,13 @@ class JTDeepseekV3MoE(DeepseekV32MoE):
         """
         indices, probabilities = self.route(hidden)
         flat = hidden.reshape(-1, hidden.shape[-1])
-        outputs = flat.new_zeros(indices.shape[0], indices.shape[1], flat.shape[-1])
-        for expert in range(self.experts.num_experts):
-            tokens, slots = torch.where(indices == expert)
-            pair = F.linear(flat[tokens], self.experts.gate_up_proj[expert])
-            gate, up = pair.chunk(2, dim=-1)
-            values = F.silu(gate) * up
-            values = F.linear(values, self.experts.down_proj[expert])
-            outputs = outputs.index_put((tokens, slots), values)
-        return (outputs * probabilities.to(outputs.dtype).unsqueeze(-1)).sum(1).reshape(hidden.shape)
+        expert_ids = indices.reshape(-1)
+        order = expert_ids.argsort()
+        sources = torch.arange(flat.shape[0], device=flat.device).repeat_interleave(indices.shape[1])[order]
+        counts = expert_ids.new_zeros(self.experts.num_experts).scatter_add_(0, expert_ids, torch.ones_like(expert_ids))
+        outputs = self.experts.forward_expert_major(flat[sources], counts)
+        weights = probabilities.reshape(-1).to(flat.dtype)[order].unsqueeze(-1)
+        return torch.zeros_like(flat).index_add_(0, sources, outputs * weights).reshape(hidden.shape)
 
     @staticmethod
     def combine_routed(owner: Any, hidden: torch.Tensor, routed: torch.Tensor) -> torch.Tensor:
