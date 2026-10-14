@@ -15,6 +15,7 @@
 """Complete standalone model construction and optional acceleration boundaries."""
 # pylint: disable=protected-access
 
+import copy
 from types import SimpleNamespace
 from typing import Any
 import unittest
@@ -30,6 +31,7 @@ from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import (
 )
 from hyper_parallel.components.losses import calculate_seq_aux_loss
 from hyper_parallel.components.modules.mtp import MultiTokenPredictionLayer
+from hyper_parallel.core.activation_memory import checkpoint_wrapper
 from hyper_parallel.data.batching import TextParallelBatch
 from hyper_parallel.distributed._builder.fsdp_adapter import FSDP2Manager
 from hyper_parallel.models.build_options import FSDP2Config
@@ -59,6 +61,71 @@ def small_config() -> JTDeepseekV3Config:
 
 class TestCompleteModel(unittest.TestCase):
     """Exercise model semantics without a builder, EP adapter or replacement pass."""
+
+    def test_auxiliary_loss_pop_preserves_router_and_input_gradients(self):
+        """Consuming the loss clears its owner but preserves the differentiable objective."""
+        torch.manual_seed(17)
+        model = JTDeepseekV3ForCausalLM(small_config())
+        moe = model.model.layers[1].mlp
+        hidden = torch.randn(1, moe.padding + 8, 16, requires_grad=True)
+        moe.route(hidden)
+        reference = moe.auxiliary_loss
+        loss = moe.pop_auxiliary_loss()
+        self.assertIs(loss, reference)
+        self.assertIsNone(moe.auxiliary_loss)
+        parameters = (hidden, moe.gate.weight)
+        expected = torch.autograd.grad(reference, parameters, retain_graph=True)
+        actual = torch.autograd.grad(loss, parameters)
+        for gradient, baseline in zip(actual, expected, strict=True):
+            torch.testing.assert_close(gradient, baseline, rtol=0, atol=0)
+            self.assertGreater(gradient.abs().sum().item(), 0)
+        with self.assertRaisesRegex(RuntimeError, "No auxiliary loss"):
+            moe.pop_auxiliary_loss()
+
+    @patch("hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3.npu_grouped_swiglu")
+    def test_checkpoint_auxiliary_loss_consumption_matches_eager_gradients(self, grouped_swiglu):
+        """Trunk and MTP replay preserve accumulated gradients without leaving loss references."""
+        # Use differentiable CPU experts to exercise graph lifetime without the NPU-only kernel.
+        def cpu_experts(inputs, gate_up_weight, down_weight, counts):
+            outputs = []
+            for index, tokens in enumerate(inputs.split(counts.tolist())):
+                gate, up = F.linear(tokens, gate_up_weight[index]).chunk(2, dim=-1)
+                outputs.append(F.linear(F.silu(gate) * up, down_weight[index]))
+            return torch.cat(outputs)
+
+        grouped_swiglu.side_effect = cpu_experts
+        torch.manual_seed(19)
+        reference = JTDeepseekV3ForCausalLM(small_config())
+        candidate = copy.deepcopy(reference)
+        for index, layer in enumerate(candidate.model.layers):
+            candidate.model.layers[index] = checkpoint_wrapper(layer)
+        for layer in candidate.mtp.layers:
+            layer.transformer_layer = checkpoint_wrapper(layer.transformer_layer)
+        owners = [module for module in candidate.modules() if isinstance(module, JTDeepseekV3MoE)]
+        self.assertEqual(len(owners), 2)
+        for objective in ("aux", "total"):
+            with self.subTest(objective=objective):
+                reference.zero_grad(set_to_none=True)
+                candidate.zero_grad(set_to_none=True)
+                for micro_step in range(3):
+                    tokens = (torch.arange(8).unsqueeze(0) + micro_step) % 32
+                    expected = reference(tokens, (tokens + 1) % 32).loss
+                    actual = candidate(tokens, (tokens + 1) % 32).loss
+                    for name, value in expected.items():
+                        torch.testing.assert_close(actual[name], value, rtol=0, atol=0)
+                    self.assertTrue(all(module.auxiliary_loss is None for module in owners))
+                    expected_loss = expected["foundation_loss/aux"] if objective == "aux" else sum(expected.values())
+                    actual_loss = actual["foundation_loss/aux"] if objective == "aux" else sum(actual.values())
+                    (expected_loss / 3).backward()
+                    (actual_loss / 3).backward()
+                    self.assertTrue(all(module.auxiliary_loss is None for module in owners))
+                for original, replayed in zip(reference.parameters(), candidate.parameters(), strict=True):
+                    if original.grad is None:
+                        self.assertIsNone(replayed.grad)
+                    else:
+                        self.assertIsNotNone(replayed.grad)
+                        torch.testing.assert_close(replayed.grad, original.grad, rtol=1e-5, atol=1e-7)
+                self.assertGreater(candidate.model.embed_tokens.weight.grad.abs().sum().item(), 0)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_standalone_forward_backward(self):
