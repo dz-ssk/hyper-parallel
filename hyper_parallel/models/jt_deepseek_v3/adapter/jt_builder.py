@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Build the JT model from its configuration and converted ``model.npz`` weights."""
+"""Build the JT model with native initialization or converted ``model.npz`` weights."""
 
 # This adapter uses the Torch/HF runtime, like the existing model and Trainer modules.
 # pylint: disable=forbidden-backend-import
@@ -32,6 +32,7 @@ from hyper_parallel.components.checkpoint.weight_conversion import get_model_con
 from hyper_parallel.models.build_options import FSDP2Config, get_device_id
 from hyper_parallel.models._transformers.model_builder import (
     _build_replacement_context,
+    _initialize_model_weights,
     apply_model_infrastructure,
     instantiate_infrastructure,
 )
@@ -102,13 +103,15 @@ def _bind_statistics_groups(model: PreTrainedModel, mesh: Any) -> None:
             module.auxiliary_loss_group = mesh.device_mesh["tp"].get_group() if mesh.tp_size > 1 else None
 
 
-def build_jt_model(*, config: dict[str, Any], reference_weights: str | Path,
+def build_jt_model(*, config: dict[str, Any], reference_weights: str | Path | None = None,
                     distributed_setup: Any, **infrastructure_options: Any) -> PreTrainedModel:
-    """Build the JT model and load its converted ``model.npz`` weights.
+    """Build the JT model with optional converted ``model.npz`` weights.
 
     Args:
         config: JT model configuration fields.
-        reference_weights: Directory containing ``model.npz``.
+        reference_weights: Directory containing ``model.npz``. If omitted or None,
+            initialize from ``config`` using the model's native initialization
+            and the caller's random seed.
         distributed_setup: Trainer distributed setup.
         **infrastructure_options: Options forwarded to ``apply_model_infrastructure``.
 
@@ -137,9 +140,12 @@ def build_jt_model(*, config: dict[str, Any], reference_weights: str | Path,
             context=_build_replacement_context(distributed_setup, None),
         )
     model.to_empty(device="cpu")
-    with np.load(Path(reference_weights) / "model.npz", allow_pickle=False) as archive:
-        arrays = {name: archive[name] for name in archive.files}
-    _load_reference_state(model, arrays)
+    if reference_weights is None:
+        _initialize_model_weights(model)
+    else:
+        with np.load(Path(reference_weights) / "model.npz", allow_pickle=False) as archive:
+            arrays = {name: archive[name] for name in archive.files}
+        _load_reference_state(model, arrays)
 
     device = torch.device(mesh.device_mesh.device_type, get_device_id())
     model.to(device)
