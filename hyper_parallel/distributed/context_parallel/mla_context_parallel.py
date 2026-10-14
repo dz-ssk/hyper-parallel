@@ -80,7 +80,8 @@ class MLAContextParallel:
         """
         if self.degree == 1:
             return query, latent, key_rope
-        query = ulysses_seq_to_head(query, 2, 1, self.mesh)
+        # Reconstruct token-major storage directly for the packed attention consumer.
+        query = ulysses_seq_to_head(query.transpose(1, 2), 1, 2, self.mesh).transpose(1, 2)
         payload = torch.cat((latent, key_rope), dim=-1)
         payload = differentiable_all_gather_concat(payload, self.mesh.get_group(), self.degree, 1)
         latent, key_rope = payload.split((latent.shape[-1], key_rope.shape[-1]), dim=-1)

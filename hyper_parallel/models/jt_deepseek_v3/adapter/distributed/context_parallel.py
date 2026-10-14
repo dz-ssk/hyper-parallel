@@ -19,7 +19,8 @@
 
 from __future__ import annotations
 
-from functools import wraps
+from collections.abc import Callable
+from functools import partial, wraps
 from types import MethodType, SimpleNamespace
 from typing import Any
 
@@ -62,12 +63,12 @@ def _head_projection_request(projection: nn.Linear, head_dim: int) -> _ForwardRe
 
 def _project_query(module: JTDeepseekV3MLAAttention, latent: torch.Tensor,
                    positions: Any) -> torch.Tensor:
-    """Build Q without depending on the KV projection or its communication."""
+    """Return a BNSD view of token-major Q without waiting for KV."""
     batch, sequence = latent.shape[:2]
     query = module.q_b_proj(latent).reshape(batch, sequence, module.num_heads, module.qk_head_dim)
     query_pass, query_rope = query.split((module.qk_nope_head_dim, module.qk_rope_head_dim), dim=-1)
-    return torch.cat((query_pass.transpose(1, 2),
-                      module.explicit_rotary(query_rope.transpose(1, 2), *positions)), dim=-1)
+    query = torch.cat((query_pass, module.explicit_rotary(query_rope, *positions, unsqueeze_dim=2)), dim=-1)
+    return query.transpose(1, 2)
 
 
 def _project_key_value(module: JTDeepseekV3MLAAttention, latent: torch.Tensor,
@@ -76,11 +77,10 @@ def _project_key_value(module: JTDeepseekV3MLAAttention, latent: torch.Tensor,
     """Preserve projection module hooks and broadcast K only after its rotation."""
     options = {} if head_range is None else {"mla_head_range": head_range}
     states = module.kv_b_proj(latent.unsqueeze(1), **options)
-    states = states.reshape(*latent.shape[:2], heads,
-                            module.qk_nope_head_dim + module.v_head_dim).transpose(1, 2)
+    states = states.reshape(*latent.shape[:2], heads, module.qk_nope_head_dim + module.v_head_dim)
     key_pass, value = states.split((module.qk_nope_head_dim, module.v_head_dim), dim=-1)
-    key = torch.cat((key_pass, key_rope.unsqueeze(1).expand(-1, heads, -1, -1)), dim=-1)
-    return key, value
+    key = torch.cat((key_pass, key_rope.unsqueeze(2).expand(-1, -1, heads, -1)), dim=-1)
+    return key.transpose(1, 2), value.transpose(1, 2)
 
 
 def _latent_inputs(module: JTDeepseekV3MLAAttention, runtime: MLAContextParallel,
@@ -96,7 +96,7 @@ def _latent_inputs(module: JTDeepseekV3MLAAttention, runtime: MLAContextParallel
         query = _project_query(module, query_latent, positions)
         payload = pending_gather.wait()
         # Launch Q before the independent KV copy, while keeping AG ahead of A2A.
-        pending_query = async_ulysses_seq_to_head_launch(query, 2, 1, runtime.mesh)
+        pending_query = async_ulysses_seq_to_head_launch(query.transpose(1, 2), 1, 2, runtime.mesh)
         kv_latent, key_rope = payload.split((module.kv_lora_rank, module.qk_rope_head_dim), dim=-1)
         kv_latent = kv_latent.contiguous()
     else:
@@ -105,7 +105,7 @@ def _latent_inputs(module: JTDeepseekV3MLAAttention, runtime: MLAContextParallel
         query, kv_latent, key_rope = runtime.latent(query, kv_latent, key_rope)
     key, value = _project_key_value(module, kv_latent, key_rope, runtime.compute_heads, runtime.head_range)
     if pending_query is not None:
-        query = pending_query.wait()
+        query = pending_query.wait().transpose(1, 2)
     return query, key, value
 
 
@@ -119,6 +119,7 @@ def _expanded_overlap_inputs(module: JTDeepseekV3MLAAttention, runtime: MLAConte
     key_rope = module.explicit_rotary(key_rope.unsqueeze(1), *positions).squeeze(1)
     key, value = _project_key_value(module, kv_latent, key_rope, module.num_heads)
     payload = torch.cat((key.transpose(1, 2), value.transpose(1, 2)), dim=-1)
+    del key, value
     payload = async_ulysses_seq_to_head_launch(payload, 1, 2, runtime.mesh).wait()
     query = pending_query.wait()
     key, value = payload.split((module.qk_head_dim, module.v_head_dim), dim=-1)
@@ -130,9 +131,6 @@ def _observed_attention(module: JTDeepseekV3MLAAttention, runtime: MLAContextPar
                         sequence_ends: tuple[int, ...]) -> torch.Tensor:
     """Keep statistics in persistent TP-head coordinates for the existing clip reducer."""
     observer = SimpleNamespace(max_logits_val=None, is_causal=True)
-    # FA consumes TND; materialize token-major storage once instead of copying BNSD first.
-    query, key, value = (tensor.transpose(1, 2).contiguous().transpose(1, 2)
-                         for tensor in (query, key, value))
     output, _ = module.attention_interface(
         observer, query, key, value, None,
         dropout=0.0, scaling=module.scaling, actual_seq_len=sequence_ends,
@@ -223,6 +221,10 @@ def mla_cp_wrapper(target_module: nn.Module, mesh: Any, tp_mesh: Any, cp_mesh: A
                                              overlap=overlap)
         if query.shape[2] != global_sequence:
             raise ValueError("JT MLA SP projection and RoPE sequence lengths disagree")
+        # This frame owns QKV: replacing the views here releases their old storage before FA.
+        query = query.transpose(1, 2).contiguous().transpose(1, 2)
+        key = key.transpose(1, 2).contiguous().transpose(1, 2)
+        value = value.transpose(1, 2).contiguous().transpose(1, 2)
         output = runtime.restore(_observed_attention(target_module, runtime, query, key, value, sequence_ends))
         return target_module.o_proj(output.reshape(1, local_sequence, -1).contiguous()), None
 
@@ -296,6 +298,25 @@ class _JTTrainingContext:
         ).reshape(())
         return numerator / count.clamp_min(1)
 
+    def projection_loss(self, local_loss: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+                        hidden: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """Weight the original local token mean before the model-level CP sum.
+
+        Args:
+            local_loss: Original projection loss returning a mean over this shard's valid targets.
+            hidden: Local hidden states, retaining the head's existing parallel boundaries.
+            targets: Model-normalized targets; ignored positions are already set to -100.
+
+        Returns:
+            This shard's contribution to the global token mean, including differentiable zero.
+        """
+        # Trainer weights JT objectives by foundation tokens, but each MTP depth has its own target count.
+        # Normalize this CP objective here, outside each chunk's checkpoint recomputation.
+        local_count = targets.ne(-100).sum().float()
+        global_count = local_count.clone()
+        dist.all_reduce(global_count, op=dist.ReduceOp.SUM, group=self.cp_group)
+        return local_loss(hidden, targets) * (local_count / global_count.clamp_min(1))
+
     def routing_statistics(self, module: JTDeepseekV3MoE, indices: torch.Tensor,
                            scores: torch.Tensor) -> torch.Tensor:
         """Reuse the public sequence objective without duplicating the root CP sum.
@@ -318,8 +339,6 @@ def configure_context_parallel(model: nn.Module, mesh: Any) -> None:
     """
     if mesh.cp_size <= 1:
         return
-    if getattr(model, "loss_chunk_size", 0):
-        raise ValueError("JT chunked projection loss requires cp_size=1; set loss_chunk_size=0 for CP")
     if getattr(model, "jt_cp_context", None) is not None:
         raise ValueError("JT model context parallelism is already installed")
     attentions = [module for module in model.modules() if isinstance(module, JTDeepseekV3MLAAttention)]
@@ -330,6 +349,8 @@ def configure_context_parallel(model: nn.Module, mesh: Any) -> None:
     model.register_forward_pre_hook(context.prepare, with_kwargs=True)
     model.register_forward_hook(context.reduce_losses)
     model._token_loss = context.token_loss
+    # Capture the original method before binding the shared LM/MTP normalization boundary.
+    model._projection_loss = partial(context.projection_loss, model._projection_loss)
     model.shift_mtp_inputs = context.shift_inputs
     for module in model.modules():
         if isinstance(module, JTDeepseekV3MoE):
