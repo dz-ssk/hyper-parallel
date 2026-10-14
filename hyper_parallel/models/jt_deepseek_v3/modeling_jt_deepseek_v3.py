@@ -46,6 +46,7 @@ from hyper_parallel.components.functional.npu_fusion_attention import (
 )
 from hyper_parallel.components.functional.npu_grouped_swiglu import npu_grouped_swiglu
 from hyper_parallel.components.functional.rotary_embedding import apply_rotary_pos_emb_single
+from hyper_parallel.core.activation_memory.recompute_state import is_recomputing
 from hyper_parallel.models.replacement import module_replacement
 from hyper_parallel.distributed.expert_parallel.routing import MOE_ROUTER_ADAPTERS
 
@@ -437,7 +438,10 @@ class JTDeepseekV3MoE(DeepseekV32MoE):
         hidden = hidden[:, padding:]
         indices, selected = MOE_ROUTER_ADAPTERS["deepseekv3"](self, hidden)
         scores = self.gate.pop_router_logits().sigmoid()
-        self.auxiliary_loss = self.routing_statistics(indices, scores)
+        auxiliary_loss = self.routing_statistics(indices, scores)
+        # Replay must keep the same tensor operations without retaining its graph on the module.
+        if not is_recomputing():
+            self.auxiliary_loss = auxiliary_loss
         flat_indices = indices.reshape(-1)
         # scatter_add_ counts on device; torch.bincount first reads the largest index back to the host.
         counts = flat_indices.new_zeros(config.n_routed_experts, dtype=torch.float32).scatter_add_(
@@ -449,6 +453,20 @@ class JTDeepseekV3MoE(DeepseekV32MoE):
             indices = torch.cat((pad_ids, indices))
             selected = torch.cat((selected.new_zeros(padding, selected.shape[-1]), selected))
         return indices, selected
+
+    def pop_auxiliary_loss(self) -> torch.Tensor:
+        """Transfer the forward loss to its consumer without retaining its graph.
+
+        Returns:
+            The differentiable auxiliary loss from the preceding forward.
+
+        Raises:
+            RuntimeError: If no unconsumed forward loss is available.
+        """
+        loss, self.auxiliary_loss = self.auxiliary_loss, None
+        if loss is None:
+            raise RuntimeError("No auxiliary loss is available; run the MoE forward before consuming it")
+        return loss
 
     def routing_statistics(self, indices: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
         """Compute the sequence objective separately from step-level router counts.
@@ -780,8 +798,8 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
         auxiliary = torch.zeros((), device=hidden.device, dtype=torch.float32)
         for layer in self.model.layers:
             hidden = layer(hidden, **attention_kwargs)
-            if hasattr(layer.mlp, "auxiliary_loss"):
-                auxiliary = auxiliary + layer.mlp.auxiliary_loss
+            if hasattr(layer.mlp, "pop_auxiliary_loss"):
+                auxiliary = auxiliary + layer.mlp.pop_auxiliary_loss()
         targets = labels.masked_fill(loss_mask == 0, -100)
         normalized = self.model.norm(hidden)
         lm_loss = (self._projection_loss(normalized, targets) if self.loss_chunk_size
@@ -791,7 +809,7 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
                               decoder_kwargs=attention_kwargs, shift_fn=self.shift_mtp_inputs,
                               sequence_end_mask=sequence_end_mask)
         for layer in self.mtp.layers:
-            auxiliary = auxiliary + layer.transformer_layer.mlp.auxiliary_loss
+            auxiliary = auxiliary + layer.transformer_layer.mlp.pop_auxiliary_loss()
         shift_targets = partial(self.shift_mtp_inputs, pad_value=-100)
         if self.loss_chunk_size:
             mtp_loss = torch.zeros_like(lm_loss)
