@@ -4,7 +4,7 @@ source /workspace/env.sh
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 WORKTREE_ROOT="$(cd -- "$SCRIPT_DIR/../../.." && pwd)"
-CONFIG="${CONFIG:-$SCRIPT_DIR/train-4k.yaml}"
+CONFIG="${CONFIG:-$SCRIPT_DIR/hp_4k_1_card.yaml}"
 WORKER_NUM="${WORKER_NUM:-1}"
 STEPS="${STEPS:-600}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-/workspace/outputs/jt_deepseek_v3}"
