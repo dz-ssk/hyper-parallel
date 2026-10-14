@@ -32,6 +32,9 @@ from hyper_parallel.components.losses import calculate_seq_aux_loss
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.utils.communication import differentiable_all_reduce
 from hyper_parallel.distributed._builder.forward_rewriter import _ForwardRewriteRequest
+from hyper_parallel.distributed.context_parallel.collectives import (
+    async_cp_allgather_launch, async_ulysses_seq_to_head_launch,
+)
 from hyper_parallel.distributed.context_parallel.mla_context_parallel import MLAContextParallel, MLACPStrategy
 from hyper_parallel.distributed.recipe_spec import inner_wrapper
 from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import JTDeepseekV3MLAAttention, JTDeepseekV3MoE
@@ -57,24 +60,69 @@ def _head_projection_request(projection: nn.Linear, head_dim: int) -> _ForwardRe
     return _ForwardRewriteRequest(projection, project)
 
 
-def _latent_inputs(module: JTDeepseekV3MLAAttention, runtime: MLAContextParallel,
-                   hidden: torch.Tensor, positions: Any) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Retain JT's Norm, shared-key gather and FP32 rotary operations."""
-    query_latent, kv_latent, key_rope = module.project_latent_inputs(hidden)
-    batch, sequence = query_latent.shape[:2]
-    query = module.q_b_proj(query_latent).reshape(batch, sequence, module.num_heads, module.qk_head_dim)
+def _project_query(module: JTDeepseekV3MLAAttention, latent: torch.Tensor,
+                   positions: Any) -> torch.Tensor:
+    """Build Q without depending on the KV projection or its communication."""
+    batch, sequence = latent.shape[:2]
+    query = module.q_b_proj(latent).reshape(batch, sequence, module.num_heads, module.qk_head_dim)
     query_pass, query_rope = query.split((module.qk_nope_head_dim, module.qk_rope_head_dim), dim=-1)
-    cos, sin = positions
-    query = torch.cat((query_pass.transpose(1, 2),
-                       module.explicit_rotary(query_rope.transpose(1, 2), cos, sin)), dim=-1)
-    key_rope = module.explicit_rotary(key_rope.unsqueeze(1), cos, sin).squeeze(1)
-    query, kv_latent, key_rope = runtime.latent(query, kv_latent, key_rope)
-    kv_states = module.kv_b_proj(kv_latent.unsqueeze(1), mla_head_range=runtime.head_range)
-    kv_states = kv_states.reshape(batch, sequence * runtime.degree, runtime.compute_heads,
-                                  module.qk_nope_head_dim + module.v_head_dim).transpose(1, 2)
-    key_pass, value = kv_states.split((module.qk_nope_head_dim, module.v_head_dim), dim=-1)
-    key = torch.cat((key_pass, key_rope.unsqueeze(1).expand(-1, runtime.compute_heads, -1, -1)), dim=-1)
+    return torch.cat((query_pass.transpose(1, 2),
+                      module.explicit_rotary(query_rope.transpose(1, 2), *positions)), dim=-1)
+
+
+def _project_key_value(module: JTDeepseekV3MLAAttention, latent: torch.Tensor,
+                       key_rope: torch.Tensor, heads: int,
+                       head_range: tuple[int, int] | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+    """Preserve projection module hooks and broadcast K only after its rotation."""
+    options = {} if head_range is None else {"mla_head_range": head_range}
+    states = module.kv_b_proj(latent.unsqueeze(1), **options)
+    states = states.reshape(*latent.shape[:2], heads,
+                            module.qk_nope_head_dim + module.v_head_dim).transpose(1, 2)
+    key_pass, value = states.split((module.qk_nope_head_dim, module.v_head_dim), dim=-1)
+    key = torch.cat((key_pass, key_rope.unsqueeze(1).expand(-1, heads, -1, -1)), dim=-1)
+    return key, value
+
+
+def _latent_inputs(module: JTDeepseekV3MLAAttention, runtime: MLAContextParallel,
+                   hidden: torch.Tensor, positions: Any, *, overlap: bool = False
+                   ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Gather during Q computation, then exchange Q during local-head KV expansion."""
+    query_latent, kv_latent, key_rope = module.project_latent_inputs(hidden)
+    pending_query = None
+    if overlap:
+        key_rope = module.explicit_rotary(key_rope.unsqueeze(1), *positions).squeeze(1)
+        payload = torch.cat((kv_latent, key_rope), dim=-1)
+        pending_gather = async_cp_allgather_launch(payload, 1, runtime.mesh)
+        query = _project_query(module, query_latent, positions)
+        payload = pending_gather.wait()
+        # Launch Q before the independent KV copy, while keeping AG ahead of A2A.
+        pending_query = async_ulysses_seq_to_head_launch(query, 2, 1, runtime.mesh)
+        kv_latent, key_rope = payload.split((module.kv_lora_rank, module.qk_rope_head_dim), dim=-1)
+        kv_latent = kv_latent.contiguous()
+    else:
+        query = _project_query(module, query_latent, positions)
+        key_rope = module.explicit_rotary(key_rope.unsqueeze(1), *positions).squeeze(1)
+        query, kv_latent, key_rope = runtime.latent(query, kv_latent, key_rope)
+    key, value = _project_key_value(module, kv_latent, key_rope, runtime.compute_heads, runtime.head_range)
+    if pending_query is not None:
+        query = pending_query.wait()
     return query, key, value
+
+
+def _expanded_overlap_inputs(module: JTDeepseekV3MLAAttention, runtime: MLAContextParallel,
+                             hidden: torch.Tensor, positions: Any
+                             ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Send Q first so shared-key rotary and KV projection can overlap it."""
+    query_latent, kv_latent, key_rope = module.project_latent_inputs(hidden)
+    query = _project_query(module, query_latent, positions).transpose(1, 2)
+    pending_query = async_ulysses_seq_to_head_launch(query, 1, 2, runtime.mesh)
+    key_rope = module.explicit_rotary(key_rope.unsqueeze(1), *positions).squeeze(1)
+    key, value = _project_key_value(module, kv_latent, key_rope, module.num_heads)
+    payload = torch.cat((key.transpose(1, 2), value.transpose(1, 2)), dim=-1)
+    payload = async_ulysses_seq_to_head_launch(payload, 1, 2, runtime.mesh).wait()
+    query = pending_query.wait()
+    key, value = payload.split((module.qk_head_dim, module.v_head_dim), dim=-1)
+    return query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2)
 
 
 def _observed_attention(module: JTDeepseekV3MLAAttention, runtime: MLAContextParallel,
@@ -102,7 +150,8 @@ def _observed_attention(module: JTDeepseekV3MLAAttention, runtime: MLAContextPar
 
 @inner_wrapper
 def mla_cp_wrapper(target_module: nn.Module, mesh: Any, tp_mesh: Any, cp_mesh: Any, ep_mesh: Any,
-                   *, strategy: MLACPStrategy = "expanded_ulysses") -> list[_ForwardRewriteRequest]:
+                   *, strategy: MLACPStrategy = "expanded_ulysses", overlap: bool = False
+                   ) -> list[_ForwardRewriteRequest]:
     """Install JT's causal MLA CP boundary after TP and before FSDP.
 
     Args:
@@ -112,13 +161,18 @@ def mla_cp_wrapper(target_module: nn.Module, mesh: Any, tp_mesh: Any, cp_mesh: A
         cp_mesh: Context-parallel axis with contiguous sequence shards.
         ep_mesh: Expert axis, unused by attention.
         strategy: Expanded QKV or latent KV communication.
+        overlap: Overlap forward communication with projections; currently requires TP1.
     """
     del mesh, ep_mesh
+    if not isinstance(overlap, bool):
+        raise ValueError("MLA CP overlap must be a bool")
     if not isinstance(target_module, JTDeepseekV3MLAAttention):
         raise ValueError("JT MLA CP requires JTDeepseekV3MLAAttention replacement")
     if getattr(target_module, "mla_cp_runtime", None) is not None:
         raise ValueError("MLA CP is already installed")
     tp_degree = 1 if tp_mesh is None else tp_mesh.size()
+    if overlap and tp_degree != 1:
+        raise ValueError("MLA CP forward overlap currently requires TP1")
     heads = target_module.config.num_attention_heads // tp_degree
     runtime = MLAContextParallel(cp_mesh, heads, strategy)
     if target_module.num_heads != heads:
@@ -158,12 +212,15 @@ def mla_cp_wrapper(target_module: nn.Module, mesh: Any, tp_mesh: Any, cp_mesh: A
             raise ValueError("JT MLA CP requires global increasing cumulative document ends")
         if hidden_states.shape[0] != 1:
             raise ValueError("JT MLA CP currently requires batch_size=1")
-        if strategy == "expanded_ulysses":
+        if strategy == "expanded_ulysses" and overlap:
+            query, key, value = _expanded_overlap_inputs(target_module, runtime, hidden_states, position_embeddings)
+        elif strategy == "expanded_ulysses":
             query, key, value = target_module._project_attention_inputs(
                 hidden_states, position_embeddings, None)
             query, key, value = runtime.expanded(query, key, value)
         else:
-            query, key, value = _latent_inputs(target_module, runtime, hidden_states, position_embeddings)
+            query, key, value = _latent_inputs(target_module, runtime, hidden_states, position_embeddings,
+                                             overlap=overlap)
         if query.shape[2] != global_sequence:
             raise ValueError("JT MLA SP projection and RoPE sequence lengths disagree")
         output = runtime.restore(_observed_attention(target_module, runtime, query, key, value, sequence_ends))
