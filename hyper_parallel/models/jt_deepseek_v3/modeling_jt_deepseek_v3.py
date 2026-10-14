@@ -45,6 +45,7 @@ from hyper_parallel.components.functional.npu_fusion_attention import (
     _attention_options, _prepare_attention_inputs, resolve_packed_sequence_lengths,
 )
 from hyper_parallel.components.functional.npu_grouped_swiglu import npu_grouped_swiglu
+from hyper_parallel.components.functional.rotary_embedding import apply_rotary_pos_emb_single
 from hyper_parallel.models.replacement import module_replacement
 from hyper_parallel.distributed.expert_parallel.routing import MOE_ROUTER_ADAPTERS
 
@@ -90,6 +91,17 @@ class JTDeepseekV3Experts(DeepseekV32Experts):
 class JTDeepseekV3RotaryEmbedding(nn.Module):
     """Rotary position embedding for the interleaved (``rope_interleave``) channel layout."""
 
+    def __init__(self, use_fused_rope: bool = False) -> None:
+        """Select the optional NPU kernel without changing the FP32 rotary contract.
+
+        Args:
+            use_fused_rope: Use the shared half-split NPU kernel after de-interleaving.
+        """
+        super().__init__()
+        if not isinstance(use_fused_rope, bool):
+            raise TypeError("use_fused_rope must be a bool")
+        self.use_fused_rope = use_fused_rope
+
     def forward(self, values: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
         """De-interleave ``values`` and rotate them by the position angles in FP32.
 
@@ -104,7 +116,10 @@ class JTDeepseekV3RotaryEmbedding(nn.Module):
         Returns:
             The rotated channels in half-split order, in the dtype of ``values``.
         """
-        ordered = torch.cat((values[..., ::2], values[..., 1::2]), dim=-1).float()
+        # Avoid strided-slice gradient scatter while preserving the rotary channel order.
+        ordered = values.unflatten(-1, (-1, 2)).transpose(-1, -2).flatten(-2).float()
+        if self.use_fused_rope:
+            return apply_rotary_pos_emb_single(ordered, cos.float(), sin.float()).to(values.dtype)
         first, second = ordered.chunk(2, dim=-1)
         rotated = torch.cat((-second, first), dim=-1)
         output = ordered * cos.unsqueeze(1).float() + rotated * sin.unsqueeze(1).float()
@@ -179,7 +194,8 @@ class JTDeepseekV3MLAAttention(MLAAttention):
         if not self.linear_qkv.weight.is_meta:
             with torch.no_grad():
                 self.linear_qkv.weight.copy_(torch.cat((module.q_a_proj.weight, module.kv_a_proj_with_mqa.weight)))
-        self.explicit_rotary = JTDeepseekV3RotaryEmbedding()
+        self.explicit_rotary = JTDeepseekV3RotaryEmbedding(
+            use_fused_rope=getattr(module.config, "use_fused_rope", False))
         self.key_rope_gather = nn.Identity()
         self.register_buffer("max_logits_val", None, persistent=False)
         self.attention_interface = observed_fusion_attention
@@ -288,7 +304,8 @@ class JTDeepseekV3Attention(DeepseekV32Attention):
         self.kv_b_proj = nn.Linear(
             self.kv_lora_rank, self.num_heads * (self.qk_nope_head_dim + self.v_head_dim), bias=False)
         self.o_proj = nn.Linear(self.num_heads * self.v_head_dim, config.hidden_size, bias=False)
-        self.explicit_rotary = JTDeepseekV3RotaryEmbedding()
+        self.explicit_rotary = JTDeepseekV3RotaryEmbedding(
+            use_fused_rope=getattr(config, "use_fused_rope", False))
         self.register_buffer("max_logits_val", None, persistent=False)
 
     def forward(self, hidden_states: torch.Tensor, position_embeddings: Any = None,

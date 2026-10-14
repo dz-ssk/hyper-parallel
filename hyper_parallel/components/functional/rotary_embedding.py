@@ -20,6 +20,39 @@ import torch  # pylint: disable=forbidden-backend-import
 import torch_npu
 
 
+def apply_rotary_pos_emb_single(
+    tensor: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    unsqueeze_dim: int = 1,
+) -> torch.Tensor:
+    """Apply half-split NPU RoPE to one query or shared-key tensor.
+
+    Args:
+        tensor: Tensor whose complete last dimension is rotated.
+        cos: Cosines in the caller-selected compute dtype.
+        sin: Sines with the same layout as cos.
+        unsqueeze_dim: Head dimension inserted into the position tables.
+
+    Returns:
+        Rotated tensor with the same shape as the input.
+
+    Raises:
+        ValueError: If the frequencies do not cover the complete head dimension.
+    """
+    if cos.ndim == 2:
+        cos = cos.unsqueeze(0)
+        sin = sin.unsqueeze(0)
+    if cos.shape[0] == 1 and tensor.shape[0] > 1:
+        cos = cos.expand(tensor.shape[0], -1, -1)
+        sin = sin.expand(tensor.shape[0], -1, -1)
+    if cos.shape[-1] != tensor.shape[-1]:
+        raise ValueError("NPU RoPE requires the rotary dimension to equal the Q/K head dimension")
+    return torch_npu.npu_rotary_mul(
+        tensor.clone(), cos.unsqueeze(unsqueeze_dim), sin.unsqueeze(unsqueeze_dim), rotary_mode="half",
+    )
+
+
 def apply_rotary_pos_emb(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -44,22 +77,12 @@ def apply_rotary_pos_emb(
         ValueError: If the rotary dimension does not cover the complete Q/K
             head dimension supported by the NPU operator interface.
     """
-    if cos.ndim == 2:
-        cos = cos.unsqueeze(0)
-        sin = sin.unsqueeze(0)
-    if cos.shape[0] == 1 and q.shape[0] > 1:
-        cos = cos.expand(q.shape[0], -1, -1)
-        sin = sin.expand(q.shape[0], -1, -1)
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-    rotary_dim = cos.shape[-1]
-    if rotary_dim != q.shape[-1] or rotary_dim != k.shape[-1]:
-        raise ValueError(
-            "NPU RoPE requires the rotary dimension to equal the Q/K head dimension"
-        )
-    q_embed = torch_npu.npu_rotary_mul(q.clone(), cos, sin, rotary_mode="half")
-    k_embed = torch_npu.npu_rotary_mul(k.clone(), cos, sin, rotary_mode="half")
-    return q_embed, k_embed
+    if cos.shape[-1] != q.shape[-1] or cos.shape[-1] != k.shape[-1]:
+        raise ValueError("NPU RoPE requires the rotary dimension to equal the Q/K head dimension")
+    return (
+        apply_rotary_pos_emb_single(q, cos, sin, unsqueeze_dim),
+        apply_rotary_pos_emb_single(k, cos, sin, unsqueeze_dim),
+    )
 
 
 def _apply_interleaved_rope(

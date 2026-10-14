@@ -30,6 +30,7 @@ from typing import Any
 _EXPORT_TO_MODULE = {
     "aggregate_hidden": "aggregate_hidden",
     "apply_rotary_pos_emb": "rotary_embedding",
+    "apply_rotary_pos_emb_single": "rotary_embedding",
     "apply_rotary_pos_emb_interleave": "rotary_embedding",
     "attention_rescale": "attention_rescale",
     "aux_loss_auto_scale": "aux_loss",
@@ -73,6 +74,7 @@ def __getattr__(name: str) -> Any:
 __all__ = [
     "aggregate_hidden",
     "apply_rotary_pos_emb",
+    "apply_rotary_pos_emb_single",
     "apply_rotary_pos_emb_interleave",
     "attention_rescale",
     "aux_loss_auto_scale",
