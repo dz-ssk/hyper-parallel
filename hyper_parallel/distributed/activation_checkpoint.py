@@ -418,6 +418,82 @@ def make_selective_checkpoint_context_fn() -> Callable[[], tuple[object, object]
     return selective_checkpoint_context_fn
 
 
+def make_saved_ops_checkpoint_context_fn(
+    operator_names: tuple[str, ...],
+) -> Callable[[], tuple[object, object]]:
+    """Keep selected operator outputs while recomputing the rest of a region.
+
+    Args:
+        operator_names: Registered Torch operator names, optionally with overloads.
+
+    Returns:
+        A factory creating independent forward and recompute caches per call.
+
+    Raises:
+        ValueError: An operator is missing or requires recomputation for correctness.
+    """
+    saved_ops = set()
+    for name in operator_names:
+        operator = _resolve_torch_op(name)
+        if not isinstance(operator, torch._ops.OpOverload):
+            raise ValueError(f"Checkpoint saved operator {name!r} is not registered")
+        if operator in _SELECTIVE_AC_FORCE_RECOMPUTE_OPS:
+            raise ValueError(f"Checkpoint operator {name!r} must be recomputed")
+        saved_ops.add(operator)
+    ensure_profiler_ops_sac_ignored()
+    ensure_fsdp_ops_sac_ignored()
+
+    def policy_fn(ctx: Any, func: Any, *args: Any, **kwargs: Any) -> CheckpointPolicy:
+        """Reuse selected results without changing the policy for other operators."""
+        del ctx, args, kwargs
+        return CheckpointPolicy.MUST_SAVE if func in saved_ops else CheckpointPolicy.MUST_RECOMPUTE
+
+    def context_fn() -> tuple[object, object]:
+        """Keep checkpoint invocations and microbatches in separate caches."""
+        return create_selective_checkpoint_contexts(policy_fn)
+
+    return context_fn
+
+
+def _layer_saved_ops(
+    containers: list[_LayerContainerInfo],
+    patterns: dict[str, list[str]],
+) -> dict[int, tuple[str, ...]]:
+    """Merge layer rules before wrapping and reject silently inactive patterns."""
+    blocks = [block for container in containers for block in container.blocks]
+    selected = {}
+    for pattern, operators in patterns.items():
+        matches = [block for block in blocks if fnmatch.fnmatchcase(block.fqn, pattern)]
+        if not matches:
+            raise ValueError(f"Checkpoint saved-operator pattern {pattern!r} matches no layer")
+        logger.info("Checkpoint saved operators: pattern=%s layers=%s operators=%s",
+                    pattern, [block.fqn for block in matches], operators)
+        for block in matches:
+            selected.setdefault(id(block.module), set()).update(operators)
+    return {module_id: tuple(sorted(operators)) for module_id, operators in selected.items()}
+
+
+def _apply_saved_operator_checkpointing(
+    containers: list[_LayerContainerInfo],
+    patterns: dict[str, list[str]],
+    swap_inputs: bool,
+) -> int:
+    """Use selective caches only in matched layers and full recomputation elsewhere."""
+    contexts = {
+        module_id: make_saved_ops_checkpoint_context_fn(operators)
+        for module_id, operators in _layer_saved_ops(containers, patterns).items()
+    }
+
+    def wrap_layer(layer: nn.Module) -> nn.Module:
+        """Preserve normal full-checkpoint behavior for unmatched layers."""
+        options = _eager_checkpoint_kwargs(swap_inputs)
+        if id(layer) in contexts:
+            options["context_fn"] = contexts[id(layer)]
+        return checkpoint_wrapper(layer, **options)
+
+    return _wrap_layer_containers(containers, wrap_layer)
+
+
 def _find_transformer_layer_container_infos(
     model: nn.Module,
 ) -> list[_LayerContainerInfo]:
@@ -1095,6 +1171,13 @@ def _apply_activation_checkpointing(
         model.gradient_checkpointing_disable()
 
     selection_source = getattr(selection, "source", "default")
+    saved_ops = getattr(selection, "save_ops", {})
+    if saved_ops and (activation_checkpoint != "full" or selection_source != "default"
+                      or enable_compile or has_kv_sharing):
+        raise ValueError(
+            "selection.save_ops requires mode=full, default layer selection, "
+            "eager execution and no KV sharing"
+        )
     if selection_source == "model_adapter_safe_regions":
         return _apply_model_adapter_safe_checkpointing(
             model,
@@ -1108,7 +1191,11 @@ def _apply_activation_checkpointing(
     # Selective recomputation normally wraps whole layers. KV-shared models
     # instead use submodule checkpointing so attention does not write the cache
     # again during backward recomputation.
-    if activation_checkpoint == "selective":
+    if saved_ops:
+        wrapped_count = _apply_saved_operator_checkpointing(containers, saved_ops, swap_inputs)
+        _warn_if_nothing_wrapped(wrapped_count, activation_checkpoint, containers)
+        logger.info("Full checkpointing with saved operators wrapped %d layer(s)", wrapped_count)
+    elif activation_checkpoint == "selective":
         wrapped_count = _apply_selective_checkpointing(
             containers,
             ac_layers,

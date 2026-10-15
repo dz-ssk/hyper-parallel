@@ -58,11 +58,13 @@ class ActivationCheckpointSelection:
     ``layer_count`` selects the contiguous prefix ``[0, layer_count)`` from
     the flattened layer-container order. ``layer_indices`` selects explicit
     zero-based entries from that same order.
+    ``save_ops`` maps layer-name patterns to operator outputs retained during full recomputation.
     """
 
     source: Literal["default", "model_adapter_safe_regions"] = "default"
     layer_count: Optional[int] = None
     layer_indices: Optional[List[int]] = None
+    save_ops: dict[str, List[str]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         """Validate the mutually exclusive layer-count and layer-index selectors."""
@@ -71,6 +73,7 @@ class ActivationCheckpointSelection:
                 "activation_checkpoint.selection.source must be default or "
                 "model_adapter_safe_regions"
             )
+        self._validate_save_ops()
         selectors = (self.layer_count is not None, self.layer_indices is not None)
         if self.source == "default" and any(selectors):
             raise ValueError(
@@ -114,6 +117,20 @@ class ActivationCheckpointSelection:
                 "contain duplicates"
             )
 
+    def _validate_save_ops(self) -> None:
+        """Reject malformed or incompatible saved-operator rules at configuration time."""
+        if not isinstance(self.save_ops, dict):
+            raise TypeError("activation_checkpoint.selection.save_ops must be a mapping")
+        if self.save_ops and self.source != "default":
+            raise ValueError("selection.save_ops requires selection.source=default")
+        for pattern, operators in self.save_ops.items():
+            if not isinstance(pattern, str) or not pattern.strip():
+                raise ValueError("selection.save_ops keys must be non-empty layer patterns")
+            if not isinstance(operators, list) or not operators or any(
+                not isinstance(name, str) or not name.strip() for name in operators
+            ):
+                raise ValueError("selection.save_ops values must be non-empty lists of operator names")
+
 
 @dataclass
 class ActivationCheckpointConfig:
@@ -133,6 +150,8 @@ class ActivationCheckpointConfig:
         """Reject ambiguous values for activation input swapping."""
         if not isinstance(self.swap_inputs, bool):
             raise TypeError("activation_checkpoint.swap_inputs must be a bool")
+        if getattr(self.selection, "save_ops", {}) and self.mode != "full":
+            raise ValueError("activation_checkpoint.selection.save_ops requires mode=full")
 
 
 @dataclass
