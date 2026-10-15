@@ -42,6 +42,91 @@ from hyper_parallel.models.jt_deepseek_v3.adapter.runtime import jt_optimizer
 class TestJTContextParallel(unittest.TestCase):
     """Check contracts independently of real distributed setup."""
 
+    def test_packed_causal_alignment_reaches_kernel_and_preserves_statistics(self) -> None:
+        """Feature: Packed causal FA modes.
+        Description: Run modes 2 and 3 against a mocked NPU attention kernel.
+        Expectation: The selected mode reaches the kernel and per-head maxima are unchanged.
+        """
+        query = torch.zeros(1, 2, 3, 4)
+        maxima = torch.tensor([2.0, 7.0])
+        stats = maxima.view(1, 2, 1).expand(3, 2, 8).clone()
+        for mode in (None, 2, 3):
+            observer = SimpleNamespace(max_logits_val=None, is_causal=True)
+            with self.subTest(mode=mode), patch(
+                "torch_npu.npu_fusion_attention", return_value=(torch.zeros(3, 2, 4), stats),
+            ) as kernel:
+                options = {} if mode is None else {"sparse_mode": mode}
+                observed_fusion_attention(observer, query, query, query, None, actual_seq_len=(1, 3), **options)
+                self.assertEqual(kernel.call_args.kwargs["sparse_mode"], 2 if mode is None else mode)
+                self.assertEqual(kernel.call_args.kwargs["softmax_layout"], "TND")
+                self.assertEqual(tuple(kernel.call_args.kwargs["actual_seq_qlen"]), (1, 3))
+                torch.testing.assert_close(observer.max_logits_val, maxima)
+
+
+    def test_explicit_left_causal_rejects_unequal_lengths(self) -> None:
+        """Feature: Packed causal FA validation.
+        Description: Explicitly request left alignment with unequal Q/K lengths.
+        Expectation: Reject the request before attention executes.
+        """
+        observer = SimpleNamespace(max_logits_val=None, is_causal=True)
+        query = torch.zeros(1, 2, 3, 4)
+        key = torch.zeros(1, 2, 5, 4)
+        with self.assertRaisesRegex(ValueError, "equal packed"):
+            observed_fusion_attention(observer, query, key, key, None,
+                                      actual_seq_qlen=(3,), actual_seq_kvlen=(5,), sparse_mode=2)
+
+
+    def test_packed_mode_does_not_override_explicit_masks_or_noncausal_attention(self) -> None:
+        """Feature: FA input compatibility.
+        Description: Exercise explicit masks, non-packed inputs and noncausal attention.
+        Expectation: Inputs outside packed implicit causal attention retain their prior mode.
+        """
+        query = torch.zeros(1, 2, 3, 4)
+        explicit_mask = torch.ones(1, 1, 3, 3, dtype=torch.bool).tril()
+        for packed, causal, mask in ((False, True, explicit_mask), (False, True, None),
+                                    (True, True, explicit_mask), (True, False, None)):
+            observer = SimpleNamespace(max_logits_val=None, is_causal=causal)
+            output = torch.zeros(3, 2, 4) if packed else query
+            stats = torch.zeros(3, 2, 8) if packed else torch.zeros(1, 2, 3, 8)
+            options = {"actual_seq_len": (3,)} if packed else {}
+            with self.subTest(packed=packed, causal=causal), patch(
+                "torch_npu.npu_fusion_attention", return_value=(output, stats),
+            ) as kernel:
+                observed_fusion_attention(observer, query, query, query, mask, **options)
+                self.assertEqual(kernel.call_args.kwargs["sparse_mode"], 0)
+
+
+    def test_explicit_packed_mode_overrides_automatic_selection(self) -> None:
+        """Feature: FA option precedence.
+        Description: Pass an explicit sparse mode that differs from the automatic mode.
+        Expectation: The explicit option is used by the kernel.
+        """
+        query = torch.zeros(1, 2, 3, 4)
+        observer = SimpleNamespace(max_logits_val=None, is_causal=True)
+        with patch("torch_npu.npu_fusion_attention", return_value=(torch.zeros(3, 2, 4),
+                                                                 torch.zeros(3, 2, 8))) as kernel:
+            observed_fusion_attention(observer, query, query, query, None,
+                                      actual_seq_len=(3,), sparse_mode=3)
+            self.assertEqual(kernel.call_args.kwargs["sparse_mode"], 3)
+
+
+    def test_automatic_causal_alignment_preserves_unequal_sequence_boundaries(self) -> None:
+        """Equal total tokens must not hide unequal per-sequence Q/K lengths."""
+        query = torch.zeros(1, 2, 3, 4)
+        for query_ends, key_ends in (((3,), (5,)), ((1, 3), (2, 3))):
+            key = torch.zeros(1, 2, key_ends[-1], 4)
+            observer = SimpleNamespace(max_logits_val=None, is_causal=True)
+            with self.subTest(query_ends=query_ends, key_ends=key_ends), patch(
+                "torch_npu.npu_fusion_attention",
+                return_value=(torch.zeros(3, 2, 4), torch.zeros(3, 2, 8)),
+            ) as kernel:
+                observed_fusion_attention(observer, query, key, key, None,
+                                          actual_seq_qlen=query_ends, actual_seq_kvlen=key_ends)
+            self.assertEqual(kernel.call_args.kwargs["sparse_mode"], 3)
+            self.assertEqual(tuple(kernel.call_args.kwargs["actual_seq_qlen"]), query_ends)
+            self.assertEqual(tuple(kernel.call_args.kwargs["actual_seq_kvlen"]), key_ends)
+
+
     def test_head_projection_keeps_parameters_and_hooks(self):
         """Selective KV projection retains FSDP hooks and Parameter identity."""
         linear = torch.nn.Linear(3, 16, bias=True).double()

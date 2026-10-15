@@ -162,6 +162,11 @@ def observed_fusion_attention(module: nn.Module, query: torch.Tensor, key: torch
     query, key, value, layout, mask, sparse_mode = _prepare_attention_inputs(
         query, key, value, attention_mask, is_packed=query_lengths is not None,
         is_causal=causal, sliding_window=window, sparse_mode=sparse_mode)
+    if query_lengths is not None and attention_mask is None and causal:
+        # Equal per-sequence Q/K lengths make both causal alignments equivalent.
+        sparse_mode = kwargs.get("sparse_mode", 2 if query_lengths == key_lengths else 3)
+        if sparse_mode == 2 and query_lengths != key_lengths:
+            raise ValueError("JT left-causal FA requires equal packed query and key/value lengths")
     result = torch_npu.npu_fusion_attention(
         query, key, value, query.shape[1], layout,
         pse=None, padding_mask=None, atten_mask=mask,
