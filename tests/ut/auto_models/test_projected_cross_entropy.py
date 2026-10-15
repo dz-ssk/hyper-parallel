@@ -23,7 +23,6 @@ from torch.utils.checkpoint import DefaultDeviceType
 from transformers.loss.loss_utils import ForCausalLMLoss
 
 from hyper_parallel.components.losses.chunked_cross_entropy import projected_cross_entropy
-from tests.common.mark_utils import arg_mark
 
 
 class TestProjectedCrossEntropy(unittest.TestCase):
@@ -34,12 +33,12 @@ class TestProjectedCrossEntropy(unittest.TestCase):
         self.addCleanup(DefaultDeviceType.set_device_type, DefaultDeviceType.get_device_type())
         DefaultDeviceType.set_device_type("cpu")
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_loss_and_scaled_gradients(self) -> None:
         """Uneven chunks, empty chunks and frozen inputs keep the eager objective."""
         cases = ((1, False, False), (3, False, False), (20, False, False), (3, True, False), (3, False, True))
         for chunk_size, frozen_hidden, frozen_head in cases:
-            with self.subTest(chunk_size=chunk_size, frozen_hidden=frozen_hidden, frozen_head=frozen_head):
+            with self.subTest(chunk_size=chunk_size,
+                              frozen_hidden=frozen_hidden, frozen_head=frozen_head):
                 torch.manual_seed(21)
                 hidden = torch.randn(2, 7, 5, requires_grad=not frozen_hidden)
                 head = nn.Linear(5, 13)
@@ -59,7 +58,6 @@ class TestProjectedCrossEntropy(unittest.TestCase):
                 for parameter, reference in zip(head.parameters(), reference_head.parameters()):
                     torch.testing.assert_close(parameter.grad, reference.grad)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_all_ignored_and_retained_graph(self) -> None:
         """Ignored targets produce zero gradients, including repeated backward."""
         hidden = torch.randn(1, 5, 3, requires_grad=True)
@@ -72,7 +70,6 @@ class TestProjectedCrossEntropy(unittest.TestCase):
         torch.testing.assert_close(hidden.grad, torch.zeros_like(hidden))
         torch.testing.assert_close(head.weight.grad, torch.zeros_like(head.weight))
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_no_logits_saved_and_projection_is_bounded(self) -> None:
         """Forward retains checkpoint inputs, never [tokens, vocabulary] activations."""
         hidden = torch.randn(1, 11, 5, requires_grad=True)
@@ -96,7 +93,6 @@ class TestProjectedCrossEntropy(unittest.TestCase):
         self.assertLessEqual(max(projected_lengths), 3)
         self.assertFalse(any(97 in shape for shape in saved_shapes), saved_shapes)
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_rejects_invalid_geometry(self) -> None:
         """Fail before a head call if sequence shards cannot align with labels."""
         hidden = torch.randn(1, 5, 3)

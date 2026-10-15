@@ -103,16 +103,18 @@ class JTDeepseekV3RotaryEmbedding(nn.Module):
             raise TypeError("use_fused_rope must be a bool")
         self.use_fused_rope = use_fused_rope
 
-    def forward(self, values: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    def forward(self, values: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
+                *, unsqueeze_dim: int = 1) -> torch.Tensor:
         """De-interleave ``values`` and rotate them by the position angles in FP32.
 
         As MindFormers does with ``rotary_dtype: float32``, the channels and tables are upcast to
         FP32 and the rotated channels are rounded to the dtype of ``values`` once.
 
         Args:
-            values: Rotary channels in interleaved order, ``[batch, heads, sequence, rope_dim]``.
+            values: Rotary channels in interleaved order, with BNSD or BSND axes.
             cos: Cosines of the position angles, ``[batch, sequence, rope_dim]``.
             sin: Sines of the position angles, ``[batch, sequence, rope_dim]``.
+            unsqueeze_dim: Head axis, 1 for BNSD or 2 for BSND inputs.
 
         Returns:
             The rotated channels in half-split order, in the dtype of ``values``.
@@ -120,10 +122,14 @@ class JTDeepseekV3RotaryEmbedding(nn.Module):
         # Avoid strided-slice gradient scatter while preserving the rotary channel order.
         ordered = values.unflatten(-1, (-1, 2)).transpose(-1, -2).flatten(-2).float()
         if self.use_fused_rope:
-            return apply_rotary_pos_emb_single(ordered, cos.float(), sin.float()).to(values.dtype)
+            return apply_rotary_pos_emb_single(
+                ordered, cos.float(), sin.float(), unsqueeze_dim=unsqueeze_dim).to(values.dtype)
         first, second = ordered.chunk(2, dim=-1)
         rotated = torch.cat((-second, first), dim=-1)
-        output = ordered * cos.unsqueeze(1).float() + rotated * sin.unsqueeze(1).float()
+        cosine_term = ordered * cos.unsqueeze(unsqueeze_dim).float()
+        del ordered, first, second
+        rotated = rotated * sin.unsqueeze(unsqueeze_dim).float()
+        output = cosine_term + rotated
         return output.to(values.dtype)
 
 
@@ -242,16 +248,18 @@ class JTDeepseekV3MLAAttention(MLAAttention):
         batch, sequence = query_latent.shape[:2]
         query = self.q_b_proj(query_latent).reshape(batch, sequence, self.num_heads, self.qk_head_dim)
         query_pass, query_rope = query.split((self.qk_nope_head_dim, self.qk_rope_head_dim), dim=-1)
+        cos, sin = position_embeddings
+        # Assemble Q before expanding KV so its old projection views can be released.
+        query = torch.cat((query_pass, self.explicit_rotary(query_rope, cos, sin, unsqueeze_dim=2)), dim=-1)
+        del query_pass, query_rope
         kv_latent = kv_latent.reshape(batch, 1, sequence, self.kv_lora_rank)
         kv_states = self.kv_b_proj(kv_latent).view(
-            batch, sequence, self.num_heads, self.qk_nope_head_dim + self.v_head_dim).transpose(1, 2)
+            batch, sequence, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
         key_pass, value = kv_states.split((self.qk_nope_head_dim, self.v_head_dim), dim=-1)
-        cos, sin = position_embeddings
-        query = torch.cat((query_pass.transpose(1, 2),
-                           self.explicit_rotary(query_rope.transpose(1, 2), cos, sin)), dim=-1)
-        key_rope = self.explicit_rotary(key_rope.unsqueeze(1), cos, sin)
-        key = torch.cat((key_pass, key_rope.expand(-1, self.num_heads, -1, -1)), dim=-1)
-        return query, key, value
+        key_rope = self.explicit_rotary(key_rope.unsqueeze(2), cos, sin, unsqueeze_dim=2)
+        key = torch.cat((key_pass, key_rope.expand(-1, -1, self.num_heads, -1)), dim=-1)
+        # Preserve the BNSD interface with token-major storage for packed attention.
+        return query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2)
 
     def forward(self, hidden_states: torch.Tensor, position_embeddings: Any = None,
                 attention_mask: Any = None, past_key_values: Any = None,
@@ -270,6 +278,10 @@ class JTDeepseekV3MLAAttention(MLAAttention):
             The attention output and ``None`` attention weights.
         """
         query, key, value = self._project_attention_inputs(hidden_states, position_embeddings, past_key_values)
+        # Replace each owning reference before FA so old projection storage can be released.
+        query = query.transpose(1, 2).contiguous().transpose(1, 2)
+        key = key.transpose(1, 2).contiguous().transpose(1, 2)
+        value = value.transpose(1, 2).contiguous().transpose(1, 2)
         output, weights = self.attention_interface(
             self, query, key, value, attention_mask,
             dropout=self.attention_dropout if self.training else 0.0, scaling=self.scaling,
@@ -661,10 +673,13 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
         )
         self.loss_tp_mesh = None
         self.loss_sequence_parallel_size = 1
-        self.loss_chunk_size = getattr(config, "loss_chunk_size", 0)
-        if (isinstance(self.loss_chunk_size, bool) or not isinstance(self.loss_chunk_size, int)
-                or self.loss_chunk_size < 0):
-            raise ValueError("loss_chunk_size must be a nonnegative integer; zero disables chunking")
+        self.enable_chunk_loss = getattr(config, "enable_chunk_loss", False)
+        self.chunk_loss_size = getattr(config, "chunk_loss_size", 1024)
+        if not isinstance(self.enable_chunk_loss, bool):
+            raise ValueError("enable_chunk_loss must be a bool")
+        if (isinstance(self.chunk_loss_size, bool) or not isinstance(self.chunk_loss_size, int)
+                or self.chunk_loss_size <= 0):
+            raise ValueError("chunk_loss_size must be a positive integer; use enable_chunk_loss to disable chunking")
         # Ranks holding the same attention heads (DP+CP); the JT builder sets it for QK clipping.
         self.qk_clip_group = None
         # Ranks holding different batch data (DP+CP); the JT builder sets it to sum expert token counts.
@@ -725,10 +740,10 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
         return loss.reshape(())
 
     def _projection_loss(self, hidden: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        """Score hidden states with the configured output-head memory policy."""
+        """Evaluate head and CE in checkpointed chunks of the CP-local sequence."""
         return projected_cross_entropy(
             hidden, targets, head=self.lm_head, loss_fn=self.loss_function,
-            vocab_size=self.config.vocab_size, chunk_size=self.loss_chunk_size,
+            vocab_size=self.config.vocab_size, chunk_size=self.chunk_loss_size,
             sequence_parallel_size=self.loss_sequence_parallel_size, tp_mesh=self.loss_tp_mesh,
         )
 
@@ -800,18 +815,19 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
             hidden = layer(hidden, **attention_kwargs)
             if hasattr(layer.mlp, "pop_auxiliary_loss"):
                 auxiliary = auxiliary + layer.mlp.pop_auxiliary_loss()
-        targets = labels.masked_fill(loss_mask == 0, -100)
+        valid = (loss_mask != 0) & (labels >= 0)
+        targets = labels.masked_fill(~valid, -100)
         normalized = self.model.norm(hidden)
-        lm_loss = (self._projection_loss(normalized, targets) if self.loss_chunk_size
+        lm_loss = (self._projection_loss(normalized, targets) if self.enable_chunk_loss
                    else self._token_loss(self.lm_head(normalized), labels, loss_mask))
         mtp_output = self.mtp(hidden, input_ids, embedding=self.model.embed_tokens,
-                              head=None if self.loss_chunk_size else self.lm_head,
+                              head=None if self.enable_chunk_loss else self.lm_head,
                               decoder_kwargs=attention_kwargs, shift_fn=self.shift_mtp_inputs,
                               sequence_end_mask=sequence_end_mask)
         for layer in self.mtp.layers:
             auxiliary = auxiliary + layer.transformer_layer.mlp.pop_auxiliary_loss()
         shift_targets = partial(self.shift_mtp_inputs, pad_value=-100)
-        if self.loss_chunk_size:
+        if self.enable_chunk_loss:
             mtp_loss = torch.zeros_like(lm_loss)
             depths = len(mtp_output.prediction_hidden_states)
             targets_by_depth = iter_mtp_targets(targets, depths, shift_fn=shift_targets,

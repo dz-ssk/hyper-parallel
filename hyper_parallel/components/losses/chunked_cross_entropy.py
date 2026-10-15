@@ -242,16 +242,17 @@ def projected_cross_entropy(
     head and CE instead of precomputing gradients from a local weight directly.
     The ordinary head and loss keep ownership of vocabulary sharding and gradient
     communication. With sequence parallelism, the head gathers rank-local chunks
-    in rank order; targets are rearranged into exactly that same order. One global
-    valid-target denominator is used for every chunk, including empty chunks.
+    in rank order; targets are rearranged into exactly that same order. Every chunk
+    uses the valid-target count of the full CP-local sequence, including empty
+    chunks. The model's CP adapter owns normalization across CP ranks.
 
     Args:
         hidden_states: Local hidden activations in [batch, local_sequence, hidden].
-        targets: Pre-shifted labels in [batch, global_sequence].
+        targets: Pre-shifted labels in [batch, cp_local_sequence], covering all SP shards.
         head: Position-wise output projection, including its existing parallel boundary wrappers.
         loss_fn: Transformers-compatible CE accepting num_items_in_batch.
         vocab_size: Global vocabulary size.
-        chunk_size: Maximum global token positions per row projected at once;
+        chunk_size: Maximum CP-local token positions per row projected at once;
             must be divisible by sequence_parallel_size.
         sequence_parallel_size: Number of contiguous equal sequence shards.
         tp_mesh: Loss-parallel mesh, re-entered during checkpoint recomputation.
