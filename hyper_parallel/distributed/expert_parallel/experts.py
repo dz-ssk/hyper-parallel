@@ -252,7 +252,7 @@ def _prepare_ep_dispatch(
     expert_weights = topk_weights.reshape(-1).to(flattened_states.dtype)
     source_indices = torch.arange(
         token_count, device=flattened_states.device
-    ).repeat_interleave(experts_per_token)
+    ).unsqueeze(1).expand(-1, experts_per_token).reshape(-1)
     destination_ranks = torch.div(expert_indices, local_expert_count, rounding_mode="floor")
     dispatch_order = (destination_ranks * global_expert_count + expert_indices).argsort()
     dispatched_states = flattened_states[source_indices[dispatch_order]].contiguous()
