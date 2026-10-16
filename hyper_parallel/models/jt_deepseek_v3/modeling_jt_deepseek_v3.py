@@ -56,6 +56,13 @@ class JTDeepseekV3Config(DeepseekV32Config):
 
     model_type = "jt_deepseek_v3"
 
+    def __init__(self, *, expert_fused_unpermute: bool = False, **kwargs: Any) -> None:
+        """Configure optional NPU BF16 weighted EP aggregation (disabled by default)."""
+        if not isinstance(expert_fused_unpermute, bool):
+            raise ValueError("expert_fused_unpermute must be a bool")
+        super().__init__(**kwargs)
+        self.expert_fused_unpermute = expert_fused_unpermute
+
 
 AutoConfig.register(JTDeepseekV3Config.model_type, JTDeepseekV3Config, exist_ok=True)
 

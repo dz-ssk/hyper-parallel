@@ -289,14 +289,52 @@ def _run_ep_local_experts(
     return ep_all_to_all(local_outputs.contiguous(), receive_counts, send_counts, ep_group)
 
 
+def _can_fuse_ep_outputs(
+    combined_outputs: torch.Tensor,
+    expert_weights: torch.Tensor,
+    dispatch_order: torch.Tensor,
+    output_shape: tuple[int, int, int],
+) -> bool:
+    """Check kernel limits using metadata only; routing guarantees a full permutation."""
+    tokens = output_shape[0] * output_shape[1]
+    routes = dispatch_order.numel()
+    return (
+        combined_outputs.device.type == "npu"
+        and combined_outputs.dtype == expert_weights.dtype == torch.bfloat16
+        and 0 < routes < 2**31
+        and tokens > 0
+        and routes % tokens == 0
+        and 1 <= routes // tokens <= 512
+    )
+
+
 def _aggregate_ep_outputs(
     combined_outputs: torch.Tensor,
     expert_weights: torch.Tensor,
     source_indices: torch.Tensor,
     dispatch_order: torch.Tensor,
     output_shape: tuple[int, int, int],
+    *,
+    fused_unpermute: bool = False,
 ) -> torch.Tensor:
     """Undo expert-major routing and aggregate weighted top-k outputs."""
+    if fused_unpermute and _can_fuse_ep_outputs(
+        combined_outputs, expert_weights, dispatch_order, output_shape
+    ):
+        # This wrapper imports optional torch_npu; CPU/CUDA paths must not load it.
+        from hyper_parallel.components.functional.moe_token_unpermute import (  # pylint: disable=C0415
+            moe_token_unpermute,
+        )
+
+        # dispatch_order maps sorted row -> original route slot; the kernel needs
+        # the inverse map, original route slot -> sorted row, as INT32.
+        inverse = torch.empty_like(dispatch_order, dtype=torch.int32)
+        inverse.scatter_(0, dispatch_order, torch.arange(
+            dispatch_order.numel(), device=dispatch_order.device, dtype=torch.int32
+        ))
+        probabilities = expert_weights.reshape(output_shape[0] * output_shape[1], -1)
+        return moe_token_unpermute(combined_outputs, inverse, probabilities).view(*output_shape)
+
     weighted_outputs = combined_outputs * expert_weights[dispatch_order].unsqueeze(-1)
     output = torch.zeros(
         output_shape[0] * output_shape[1],
@@ -314,6 +352,7 @@ def ep_routed_forward(
     *,
     router_fn: Callable,
     ep_group: Any,
+    fused_unpermute: bool = False,
 ) -> torch.Tensor:
     """Routed-experts pipeline: SP-in (local chunk) -> all communication
     inside -> SP-out. **Routed branch only.**
@@ -348,6 +387,10 @@ def ep_routed_forward(
 
     ``router_fn`` is supplied BY THE CALLER (explicit choice, e.g. an entry
     of MOE_ROUTER_ADAPTERS picked by name in the factory code).
+
+    ``fused_unpermute`` opts into NPU BF16 weighted output aggregation;
+    unsupported dtypes, empty inputs and kernel index/top-k limits use the
+    reference path. Floating-point rounding may differ from that path.
 
     Extended EP group = the ep axis of the derived expert mesh (flatten
     ep_size consecutive ranks: first span the TP group, then extend to
@@ -388,6 +431,7 @@ def ep_routed_forward(
         dispatch.source_indices,
         dispatch.dispatch_order,
         output_shape,
+        fused_unpermute=fused_unpermute,
     )
 
 

@@ -86,7 +86,7 @@ The factory must RETURN the compute fn
 tensors inside the local-region skeleton.
 """
 
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 import torch
 
@@ -140,9 +140,10 @@ def build_ep_compute(
     *,
     router_fn: Callable,
     archetype_key: str,
-    expected_attrs,
+    expected_attrs: Sequence[str],
     combine: Callable,
     use_grouped_gemm: bool = False,
+    fused_unpermute: bool = False,
 ) -> Callable:
     """Shared skeleton for archetype factories: validate context, assert the
     interface, bind the local expert entry point, and close over the
@@ -156,7 +157,22 @@ def build_ep_compute(
     ``models/qwen3_moe/adapter/distributed/expert_parallel.py``) compose
     their EP archetype on top of this skeleton while the router adapters and
     dispatch primitives stay in this generic layer.
+
+    Args:
+        module: MoE block whose routed branch is bound.
+        ep_mesh: Expert mesh providing the EP process group.
+        router_fn: Returns token-major top-k indices and weights.
+        archetype_key: Explicit model-family interface identifier.
+        expected_attrs: Required attributes on the MoE block.
+        combine: Composes routed and model-specific branches.
+        use_grouped_gemm: Bind grouped GEMM for local experts.
+        fused_unpermute: Opt into NPU BF16 weighted aggregation, default False.
+
+    Raises:
+        ValueError: If the fusion flag is not a bool or the EP context is invalid.
     """
+    if not isinstance(fused_unpermute, bool):
+        raise ValueError("fused_unpermute must be a bool")
     ep_group = _require_ep_group(ep_mesh, f"archetype '{archetype_key}'")
     _require_moe_interface(module, expected_attrs, archetype_key)
     if use_grouped_gemm:
@@ -170,10 +186,12 @@ def build_ep_compute(
         # archetype and for Qwen3 when grouped GEMM is disabled.
         bind_local_expert_forward(module, ep_mesh["ep"].size())
 
+    aggregation_options = {"fused_unpermute": True} if fused_unpermute else {}
+
     def compute_fn(module: Any, hidden_states: torch.Tensor) -> torch.Tensor:
         """Run the routed branch and compose the MoE block output."""
         routed = ep_routed_forward(
-            module, hidden_states, router_fn=router_fn, ep_group=ep_group)
+            module, hidden_states, router_fn=router_fn, ep_group=ep_group, **aggregation_options)
         return combine(module, hidden_states, routed)
 
     return compute_fn
