@@ -86,7 +86,7 @@ The factory must RETURN the compute fn
 tensors inside the local-region skeleton.
 """
 
-from typing import Any, Callable
+from typing import Any, Callable, Optional, Sequence
 
 import torch
 
@@ -140,9 +140,10 @@ def build_ep_compute(
     *,
     router_fn: Callable,
     archetype_key: str,
-    expected_attrs,
+    expected_attrs: Sequence[str],
     combine: Callable,
     use_grouped_gemm: bool = False,
+    split_fn: Optional[Callable[[int], tuple[list[int], list[int]]]] = None,
 ) -> Callable:
     """Shared skeleton for archetype factories: validate context, assert the
     interface, bind the local expert entry point, and close over the
@@ -156,7 +157,26 @@ def build_ep_compute(
     ``models/qwen3_moe/adapter/distributed/expert_parallel.py``) compose
     their EP archetype on top of this skeleton while the router adapters and
     dispatch primitives stay in this generic layer.
+
+    ``split_fn`` is an optional model-owned callback returning exact send and
+    receive counts from the local token count. Its routing and cross-rank
+    shape assumptions must be validated by the adapter before binding.
+
+    Args:
+        module: MoE module whose expert execution is being bound.
+        ep_mesh: Expert mesh with an ``ep`` dimension.
+        router_fn: Model-owned routing function.
+        archetype_key: Interface name used in validation messages.
+        expected_attrs: Attributes required by this model archetype.
+        combine: Function composing the routed branch with other model branches.
+        use_grouped_gemm: Whether to bind grouped expert computation.
+        split_fn: Optional exact per-peer counts from the local token count.
+
+    Returns:
+        Bound expert-parallel computation function.
     """
+    if split_fn is not None and not callable(split_fn):
+        raise ValueError("split_fn must be callable or None")
     ep_group = _require_ep_group(ep_mesh, f"archetype '{archetype_key}'")
     _require_moe_interface(module, expected_attrs, archetype_key)
     if use_grouped_gemm:
@@ -172,8 +192,9 @@ def build_ep_compute(
 
     def compute_fn(module: Any, hidden_states: torch.Tensor) -> torch.Tensor:
         """Run the routed branch and compose the MoE block output."""
+        options = {} if split_fn is None else {"split_fn": split_fn}
         routed = ep_routed_forward(
-            module, hidden_states, router_fn=router_fn, ep_group=ep_group)
+            module, hidden_states, router_fn=router_fn, ep_group=ep_group, **options)
         return combine(module, hidden_states, routed)
 
     return compute_fn

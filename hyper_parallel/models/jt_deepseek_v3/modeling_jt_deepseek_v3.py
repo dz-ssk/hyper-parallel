@@ -56,6 +56,13 @@ class JTDeepseekV3Config(DeepseekV32Config):
 
     model_type = "jt_deepseek_v3"
 
+    def __init__(self, *, expert_static_splits: bool = False, **kwargs: Any) -> None:
+        """Configure opt-in fixed-route EP counts; topology is checked by the adapter."""
+        if not isinstance(expert_static_splits, bool):
+            raise ValueError("expert_static_splits must be a boolean")
+        super().__init__(**kwargs)
+        self.expert_static_splits = expert_static_splits
+
 
 AutoConfig.register(JTDeepseekV3Config.model_type, JTDeepseekV3Config, exist_ok=True)
 

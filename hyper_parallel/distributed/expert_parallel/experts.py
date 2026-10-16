@@ -243,6 +243,7 @@ def _prepare_ep_dispatch(
     global_expert_count: int,
     ep_size: int,
     ep_group: Any,
+    split_fn: Optional[Callable[[int], tuple[list[int], list[int]]]] = None,
 ) -> _EPDispatch:
     """Sort routed tokens and exchange per-rank dispatch counts."""
     flattened_states = hidden_states.reshape(-1, hidden_states.shape[-1])
@@ -257,17 +258,26 @@ def _prepare_ep_dispatch(
     dispatch_order = (destination_ranks * global_expert_count + expert_indices).argsort()
     dispatched_states = flattened_states[source_indices[dispatch_order]].contiguous()
     dispatched_indices = expert_indices[dispatch_order].unsqueeze(-1).contiguous()
-    send_counts_tensor = torch.bincount(destination_ranks, minlength=ep_size)
-    receive_counts_tensor = torch.empty_like(send_counts_tensor)
-    dist.all_to_all_single(receive_counts_tensor, send_counts_tensor, group=ep_group)
+    if split_fn is None:
+        send_counts_tensor = torch.bincount(destination_ranks, minlength=ep_size)
+        receive_counts_tensor = torch.empty_like(send_counts_tensor)
+        dist.all_to_all_single(receive_counts_tensor, send_counts_tensor, group=ep_group)
+        send_counts, receive_counts = send_counts_tensor.tolist(), receive_counts_tensor.tolist()
+    else:
+        send_counts, receive_counts = split_fn(token_count)
+        if (len(send_counts) != ep_size or len(receive_counts) != ep_size
+                or any(not isinstance(count, int) or isinstance(count, bool) or count < 0
+                       for count in send_counts + receive_counts)
+                or sum(send_counts) != expert_indices.numel()):
+            raise ValueError("split_fn must return non-negative integer EP counts covering all routed tokens")
     return _EPDispatch(
         source_indices=source_indices,
         expert_weights=expert_weights,
         dispatch_order=dispatch_order,
         states=dispatched_states,
         expert_indices=dispatched_indices,
-        send_counts=send_counts_tensor.tolist(),
-        receive_counts=receive_counts_tensor.tolist(),
+        send_counts=send_counts,
+        receive_counts=receive_counts,
     )
 
 
@@ -314,6 +324,7 @@ def ep_routed_forward(
     *,
     router_fn: Callable,
     ep_group: Any,
+    split_fn: Optional[Callable[[int], tuple[list[int], list[int]]]] = None,
 ) -> torch.Tensor:
     """Routed-experts pipeline: SP-in (local chunk) -> all communication
     inside -> SP-out. **Routed branch only.**
@@ -355,6 +366,21 @@ def ep_routed_forward(
     homogeneous across TP). Expert weights are only Shard(0) along the
     expert dim -- each rank holds num_experts/ep_size complete experts, so
     there is no all_gather/reduce_scatter pair.
+
+    ``split_fn(token_count)`` optionally supplies exact per-peer send/receive
+    counts, bypassing the count collective and its device-to-host reads. The
+    caller must prove the routing and cross-rank token-count contract; local
+    validation cannot detect inconsistent receive counts on another rank.
+
+    Args:
+        module: MoE module containing the local experts.
+        hidden_states: Local batch of token representations.
+        router_fn: Model-owned expert selection and weighting function.
+        ep_group: Process group used for expert dispatch and combine.
+        split_fn: Optional exact per-peer counts from the local token count.
+
+    Returns:
+        Weighted routed-expert output with the input shape.
     """
     ep_size = ep_group.size()
     ep_rank = dist.get_rank(group=ep_group)
@@ -372,6 +398,7 @@ def ep_routed_forward(
         global_expert_count=global_expert_count,
         ep_size=ep_size,
         ep_group=ep_group,
+        split_fn=split_fn,
     )
     combined_expert_outputs = _run_ep_local_experts(
         module,
