@@ -98,6 +98,22 @@ def resolve_swiglu_weights(
     return w_gate, w_up, w_down
 
 
+def _expert_token_counts(indices: torch.Tensor, expert_count: int) -> torch.Tensor:
+    """Count 1-D integer router indices in the known exclusive expert range.
+
+    Router selection and EP partitioning guarantee ``0 <= indices < expert_count``.
+    On NPU, use a fixed-size INT64 result instead of bincount's dynamic range
+    discovery. Do not read device values to validate this internal invariant.
+    Other devices retain their native bincount path.
+    """
+    if indices.device.type != "npu":
+        return torch.bincount(indices, minlength=expert_count)
+    counts = indices.new_zeros(expert_count, dtype=torch.int64)
+    return counts.scatter_add_(
+        0, indices.to(torch.int64), torch.ones_like(indices, dtype=torch.int64)
+    )
+
+
 def _local_swiglu_expert_forward(experts, dispatched_states, local_expert_indices):
     """Compute dispatched tokens with the local stacked SwiGLU experts.
 
@@ -108,10 +124,7 @@ def _local_swiglu_expert_forward(experts, dispatched_states, local_expert_indice
     """
     token_order = local_expert_indices.argsort()
     sorted_states = dispatched_states[token_order]
-    local_expert_counts = torch.bincount(
-        local_expert_indices,
-        minlength=experts.local_expert_count,
-    )
+    local_expert_counts = _expert_token_counts(local_expert_indices, experts.local_expert_count)
     if getattr(experts, "_ep_use_grouped_gemm", False):
         grouped_forward = getattr(experts, "forward_expert_major", None)
         if callable(grouped_forward):
@@ -257,7 +270,7 @@ def _prepare_ep_dispatch(
     dispatch_order = (destination_ranks * global_expert_count + expert_indices).argsort()
     dispatched_states = flattened_states[source_indices[dispatch_order]].contiguous()
     dispatched_indices = expert_indices[dispatch_order].unsqueeze(-1).contiguous()
-    send_counts_tensor = torch.bincount(destination_ranks, minlength=ep_size)
+    send_counts_tensor = _expert_token_counts(destination_ranks, ep_size)
     receive_counts_tensor = torch.empty_like(send_counts_tensor)
     dist.all_to_all_single(receive_counts_tensor, send_counts_tensor, group=ep_group)
     return _EPDispatch(
