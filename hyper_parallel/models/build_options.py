@@ -160,9 +160,14 @@ class FSDP2Config:
     forward_prefetch_depth: int = 1
     comm_fusion: bool = False
     comm_fusion_zero_copy: Optional[bool] = None
+    delayed_sync_patterns: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
-        """Validate topology sizes and prefetch depths."""
+        """Validate topology sizes, prefetch depths and delayed-sync selectors."""
+        if not isinstance(self.delayed_sync_patterns, list) or any(
+            not isinstance(pattern, str) or not pattern for pattern in self.delayed_sync_patterns
+        ):
+            raise ValueError("delayed_sync_patterns must be a list of non-empty module-name patterns")
         if self.dp_shard_size < 1:
             raise ValueError("dp_shard_size must be greater than or equal to 1")
         if self.edp_shard_size < 1:

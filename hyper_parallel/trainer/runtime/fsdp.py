@@ -26,10 +26,13 @@ duck-typed (``reshard_after_backward`` / ``dp_shard_size`` /
 import logging
 from collections import defaultdict
 from dataclasses import dataclass, field
+from fnmatch import fnmatchcase
 from typing import Any, List, Optional
 
 import torch
 from torch.utils._pytree import tree_flatten
+
+from hyper_parallel.core.fully_shard.api import HSDPModule
 
 
 logger = logging.getLogger(__name__)
@@ -389,6 +392,26 @@ def model_reshard(
                 model_part.set_reshard_after_backward(True)
 
 
+def _delayed_sync_modules(model_parts, patterns):
+    """Resolve selectors before mutating synchronization state on any model part."""
+    if not patterns:
+        return []
+    selected = []
+    matched = set()
+    for model_part in model_parts:
+        for name, module in model_part.named_modules():
+            if not isinstance(module, HSDPModule):
+                continue
+            matches = {pattern for pattern in patterns if fnmatchcase(name, pattern)}
+            if matches:
+                selected.append(module)
+                matched.update(matches)
+    missing = set(patterns) - matched
+    if missing:
+        raise ValueError(f"delayed_sync_patterns matched no HSDP modules: {sorted(missing)}")
+    return selected
+
+
 def configure_fsdp_gradient_sync(
     hsdp_model_parts: List[Any],
     fsdp_config: Any,
@@ -396,11 +419,32 @@ def configure_fsdp_gradient_sync(
     micro_step: int,
     num_micro_steps: int,
 ) -> None:
-    """Configure FSDP gradient synchronization for one micro step."""
+    """Configure global synchronization, then override selected HSDP subtrees.
+
+    Args:
+        hsdp_model_parts: Model-part roots with the HSDP runtime API.
+        fsdp_config: FSDP settings; optional ``delayed_sync_patterns`` selects
+            subtrees by case-sensitive glob, relative to each model-part root.
+        dp_replicate_size: Number of HSDP replicas.
+        micro_step: Zero-based micro-batch index in the optimizer step.
+        num_micro_steps: Number of micro-batches in the optimizer step.
+
+    Raises:
+        ValueError: If an active delayed-sync pattern matches no HSDP module
+            across all model parts. Validation precedes state changes.
+
+    Note:
+        Selected subtrees retain full gradients until the last micro-batch.
+        Empty selectors preserve the global policy. Without accumulation or
+        DP sharding this function retains its existing no-op behavior.
+    """
     if (
             fsdp_config.dp_shard_size > 1
             and num_micro_steps > 1
     ):
+        delayed_modules = _delayed_sync_modules(
+            hsdp_model_parts, getattr(fsdp_config, "delayed_sync_patterns", ())
+        )
         is_last_micro_batch = micro_step == num_micro_steps - 1
         requires_gradient_sync = (
             fsdp_config.requires_grad_sync
@@ -412,6 +456,10 @@ def configure_fsdp_gradient_sync(
             model_part.set_is_last_backward(is_last_micro_batch)
             if is_hsdp:
                 model_part.set_requires_all_reduce(is_last_micro_batch)
+        # Root setters recurse: apply subtree overrides only after every root
+        # has restored the global policy for this micro-batch.
+        for module in delayed_modules:
+            module.set_requires_gradient_sync(is_last_micro_batch)
 
 
 __all__ = [
