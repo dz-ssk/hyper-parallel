@@ -130,7 +130,10 @@ def _observed_attention(module: JTDeepseekV3MLAAttention, runtime: MLAContextPar
                         query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
                         sequence_ends: tuple[int, ...]) -> torch.Tensor:
     """Keep statistics in persistent TP-head coordinates for the existing clip reducer."""
-    observer = SimpleNamespace(max_logits_val=None, is_causal=True)
+    observer = SimpleNamespace(
+        max_logits_val=None, is_causal=True,
+        fa_single_sequence_bnsd=getattr(module.config, "fa_single_sequence_bnsd", False),
+    )
     output, _ = module.attention_interface(
         observer, query, key, value, None,
         dropout=0.0, scaling=module.scaling, actual_seq_len=sequence_ends,

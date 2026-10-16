@@ -56,6 +56,13 @@ class JTDeepseekV3Config(DeepseekV32Config):
 
     model_type = "jt_deepseek_v3"
 
+    def __init__(self, *, fa_single_sequence_bnsd: bool = False, **kwargs: Any) -> None:
+        """Configure optional BNSD layout for a single complete packed document."""
+        if not isinstance(fa_single_sequence_bnsd, bool):
+            raise ValueError("fa_single_sequence_bnsd must be a bool")
+        super().__init__(**kwargs)
+        self.fa_single_sequence_bnsd = fa_single_sequence_bnsd
+
 
 AutoConfig.register(JTDeepseekV3Config.model_type, JTDeepseekV3Config, exist_ok=True)
 
@@ -133,6 +140,22 @@ class JTDeepseekV3RotaryEmbedding(nn.Module):
         return output.to(values.dtype)
 
 
+def _single_sequence_bnsd_inputs(module, qkv, sequence_lengths, attention_mask, dropout, window, causal):
+    """Retain original BNSD views only when packed boundaries describe one full document."""
+    if not getattr(module, "fa_single_sequence_bnsd", False):
+        return None
+    query, key, value = qkv
+    query_lengths, key_lengths = sequence_lengths
+    eligible = (
+        query.shape[0] == key.shape[0] == value.shape[0] == 1
+        and query.shape[2] > 0
+        and query.shape[2] == key.shape[2] == value.shape[2]
+        and query_lengths == key_lengths == [query.shape[2]]
+        and attention_mask is None and causal and window is None and dropout == 0.0
+    )
+    return qkv if eligible else None
+
+
 def observed_fusion_attention(module: nn.Module, query: torch.Tensor, key: torch.Tensor,
                               value: torch.Tensor, attention_mask: Any, dropout: float = 0.0,
                               scaling: float | None = None, **kwargs: Any) -> tuple[torch.Tensor, None]:
@@ -159,9 +182,19 @@ def observed_fusion_attention(module: nn.Module, query: torch.Tensor, key: torch
     query_lengths, key_lengths = resolve_packed_sequence_lengths(
         kwargs, batch_size * query_length, key.shape[0] * key.shape[2])
     pre_tokens, next_tokens, sparse_mode, window, causal = _attention_options(module, kwargs)
+    bnsd_inputs = _single_sequence_bnsd_inputs(
+        module, (query, key, value), (query_lengths, key_lengths), attention_mask, dropout, window, causal
+    )
     query, key, value, layout, mask, sparse_mode = _prepare_attention_inputs(
         query, key, value, attention_mask, is_packed=query_lengths is not None,
         is_causal=causal, sliding_window=window, sparse_mode=sparse_mode)
+    if bnsd_inputs is not None and sparse_mode in (2, 3):
+        # Reuse the prepared causal mask and effective sparse mode. Keeping the
+        # original views avoids reconstructing BNSD from the flattened TND input.
+        query, key, value = (tensor.contiguous() for tensor in bnsd_inputs)
+        layout = "BNSD"
+        query_lengths = key_lengths = None
+    del bnsd_inputs
     result = torch_npu.npu_fusion_attention(
         query, key, value, query.shape[1], layout,
         pse=None, padding_mask=None, atten_mask=mask,
@@ -204,6 +237,7 @@ class JTDeepseekV3MLAAttention(MLAAttention):
         self.explicit_rotary = JTDeepseekV3RotaryEmbedding(
             use_fused_rope=getattr(module.config, "use_fused_rope", False))
         self.key_rope_gather = nn.Identity()
+        self.fa_single_sequence_bnsd = getattr(module.config, "fa_single_sequence_bnsd", False)
         self.register_buffer("max_logits_val", None, persistent=False)
         self.attention_interface = observed_fusion_attention
 
@@ -302,6 +336,7 @@ class JTDeepseekV3Attention(DeepseekV32Attention):
         """
         nn.Module.__init__(self)
         self.config, self.layer_idx = config, layer_idx
+        self.fa_single_sequence_bnsd = getattr(config, "fa_single_sequence_bnsd", False)
         self.num_heads = config.num_attention_heads
         self.q_lora_rank, self.kv_lora_rank = config.q_lora_rank, config.kv_lora_rank
         self.qk_rope_head_dim, self.qk_nope_head_dim = config.qk_rope_head_dim, config.qk_nope_head_dim
