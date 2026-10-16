@@ -55,9 +55,14 @@ def enable_full_determinism(seed: int) -> None:
     os.environ["NCCL_DETERMINISTIC"] = "1"
     os.environ["FLASH_ATTENTION_DETERMINISTIC"] = "1"
     if IS_NPU_AVAILABLE:
-        # The environment variable required to enable deterministic mode on Ascend NPUs.
+        # The environment variable required for deterministic collective communication on Ascend NPUs.
         os.environ["NCCL_DETERMINISTIC"] = "true"
-        os.environ["CLOSE_MATMUL_K_SHIFT"] = "1"
+        # Deliberately not touching CLOSE_MATMUL_K_SHIFT here: CANN's K-shift and non-K-shift matmul
+        # tilings are each independently run-to-run reproducible on their own (confirmed on real
+        # hardware), so neither is required for *this* function's determinism guarantee. Forcing it
+        # off only matters for bitwise comparison against a reference implementation that happens to
+        # use CANN's default (non-K-shift) tiling, which is a cross-framework parity concern, not a
+        # determinism one, and doesn't belong in this function.
 
     random.seed(seed)
     np.random.seed(seed)
