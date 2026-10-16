@@ -56,6 +56,18 @@ class JTDeepseekV3Config(DeepseekV32Config):
 
     model_type = "jt_deepseek_v3"
 
+    def __init__(self, expert_local_reorder: bool = False, **kwargs: Any) -> None:
+        """Configure JT with optional NPU local expert token reordering.
+
+        Args:
+            expert_local_reorder: Enable local gather and unweighted unpermute.
+            **kwargs: Base DeepSeek configuration fields.
+        """
+        if not isinstance(expert_local_reorder, bool):
+            raise ValueError("expert_local_reorder must be a bool")
+        super().__init__(**kwargs)
+        self.expert_local_reorder = expert_local_reorder
+
 
 AutoConfig.register(JTDeepseekV3Config.model_type, JTDeepseekV3Config, exist_ok=True)
 

@@ -86,7 +86,7 @@ The factory must RETURN the compute fn
 tensors inside the local-region skeleton.
 """
 
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 import torch
 
@@ -140,9 +140,10 @@ def build_ep_compute(
     *,
     router_fn: Callable,
     archetype_key: str,
-    expected_attrs,
+    expected_attrs: Sequence[str],
     combine: Callable,
     use_grouped_gemm: bool = False,
+    local_reorder: bool = False,
 ) -> Callable:
     """Shared skeleton for archetype factories: validate context, assert the
     interface, bind the local expert entry point, and close over the
@@ -156,7 +157,25 @@ def build_ep_compute(
     ``models/qwen3_moe/adapter/distributed/expert_parallel.py``) compose
     their EP archetype on top of this skeleton while the router adapters and
     dispatch primitives stay in this generic layer.
+
+    Args:
+        module: MoE block whose routed experts are bound.
+        ep_mesh: Expert mesh providing the EP process group.
+        router_fn: Returns token-major top-k indices and weights.
+        archetype_key: Explicit model-family interface identifier.
+        expected_attrs: Required attributes on the MoE block.
+        combine: Composes routed and model-specific branches.
+        use_grouped_gemm: Bind grouped GEMM for local experts.
+        local_reorder: Opt into NPU local gather and unweighted unpermute.
+
+    Returns:
+        The bound expert-compute callback.
+
+    Raises:
+        ValueError: If local_reorder is not a bool or the EP context is invalid.
     """
+    if not isinstance(local_reorder, bool):
+        raise ValueError("local_reorder must be a bool")
     ep_group = _require_ep_group(ep_mesh, f"archetype '{archetype_key}'")
     _require_moe_interface(module, expected_attrs, archetype_key)
     if use_grouped_gemm:
@@ -169,6 +188,8 @@ def build_ep_compute(
         # Keep the established call contract unchanged for every reference
         # archetype and for Qwen3 when grouped GEMM is disabled.
         bind_local_expert_forward(module, ep_mesh["ep"].size())
+
+    module.experts.ep_local_reorder = local_reorder
 
     def compute_fn(module: Any, hidden_states: torch.Tensor) -> torch.Tensor:
         """Run the routed branch and compose the MoE block output."""

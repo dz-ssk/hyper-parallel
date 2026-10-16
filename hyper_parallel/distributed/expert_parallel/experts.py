@@ -98,6 +98,34 @@ def resolve_swiglu_weights(
     return w_gate, w_up, w_down
 
 
+def _can_unpermute_local_tokens(states: torch.Tensor, order: torch.Tensor) -> bool:
+    """Limit the optional kernel to the validated local BF16 permutation path."""
+    return (
+        states.device.type == "npu" and states.dtype == torch.bfloat16
+        and states.ndim == 2 and states.shape[1] > 0
+        and order.ndim == 1 and order.dtype == torch.int64
+        and order.device == states.device and states.shape[0] == order.numel()
+        and 0 < order.numel() < 2**31
+    )
+
+
+def _restore_local_token_order(
+    sorted_states: torch.Tensor, order: torch.Tensor, use_fused: bool = False,
+) -> torch.Tensor:
+    """Invert an argsort permutation without routing weights or accumulation."""
+    if use_fused and _can_unpermute_local_tokens(sorted_states, order):
+        # Optional NPU dependency must not be imported by CPU/CUDA EP users.
+        from hyper_parallel.components.functional.moe_token_unpermute import (  # pylint: disable=C0415
+            moe_token_unpermute,
+        )
+        inverse = torch.empty_like(order, dtype=torch.int32)
+        inverse.scatter_(0, order, torch.arange(order.numel(), device=order.device, dtype=torch.int32))
+        return moe_token_unpermute(sorted_states, inverse)
+    output = torch.empty_like(sorted_states)
+    output[order] = sorted_states
+    return output
+
+
 def _local_swiglu_expert_forward(experts, dispatched_states, local_expert_indices):
     """Compute dispatched tokens with the local stacked SwiGLU experts.
 
@@ -107,7 +135,11 @@ def _local_swiglu_expert_forward(experts, dispatched_states, local_expert_indice
     reshard expert parameters around the local computation.
     """
     token_order = local_expert_indices.argsort()
-    sorted_states = dispatched_states[token_order]
+    local_reorder = getattr(experts, "ep_local_reorder", False)
+    if local_reorder and dispatched_states.device.type == "npu":
+        sorted_states = dispatched_states.index_select(0, token_order)
+    else:
+        sorted_states = dispatched_states[token_order]
     local_expert_counts = torch.bincount(
         local_expert_indices,
         minlength=experts.local_expert_count,
@@ -128,9 +160,7 @@ def _local_swiglu_expert_forward(experts, dispatched_states, local_expert_indice
                 down_weight,
                 local_expert_counts,
             )
-        output = torch.empty_like(sorted_output)
-        output[token_order] = sorted_output
-        return output
+        return _restore_local_token_order(sorted_output, token_order, use_fused=local_reorder)
 
     gate_weight, up_weight, down_weight = resolve_swiglu_weights(experts)
     sorted_outputs = []
