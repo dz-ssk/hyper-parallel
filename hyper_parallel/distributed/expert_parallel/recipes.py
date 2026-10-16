@@ -86,7 +86,7 @@ The factory must RETURN the compute fn
 tensors inside the local-region skeleton.
 """
 
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 import torch
 
@@ -140,9 +140,10 @@ def build_ep_compute(
     *,
     router_fn: Callable,
     archetype_key: str,
-    expected_attrs,
+    expected_attrs: Sequence[str],
     combine: Callable,
     use_grouped_gemm: bool = False,
+    sort_in_fp32: bool = False,
 ) -> Callable:
     """Shared skeleton for archetype factories: validate context, assert the
     interface, bind the local expert entry point, and close over the
@@ -152,11 +153,17 @@ def build_ep_compute(
     ``combine(module, hidden_states, routed) -> Tensor`` receives the routed
     branch output and returns the MoE block output.
 
+    ``sort_in_fp32`` defaults to false. Enabling it selects FP32 expert keys
+    for NPU dispatch and local grouping when the keys are exactly representable;
+    equal-key token order and floating-point accumulation may change.
+
     Public since M3 (adjust doc §5.4): model adapters (e.g.
     ``models/qwen3_moe/adapter/distributed/expert_parallel.py``) compose
     their EP archetype on top of this skeleton while the router adapters and
     dispatch primitives stay in this generic layer.
     """
+    if not isinstance(sort_in_fp32, bool):
+        raise ValueError("sort_in_fp32 must be a boolean")
     ep_group = _require_ep_group(ep_mesh, f"archetype '{archetype_key}'")
     _require_moe_interface(module, expected_attrs, archetype_key)
     if use_grouped_gemm:
@@ -170,10 +177,13 @@ def build_ep_compute(
         # archetype and for Qwen3 when grouped GEMM is disabled.
         bind_local_expert_forward(module, ep_mesh["ep"].size())
 
+    module.experts.ep_sort_in_fp32 = sort_in_fp32
+
     def compute_fn(module: Any, hidden_states: torch.Tensor) -> torch.Tensor:
         """Run the routed branch and compose the MoE block output."""
+        options = {"sort_in_fp32": True} if sort_in_fp32 else {}
         routed = ep_routed_forward(
-            module, hidden_states, router_fn=router_fn, ep_group=ep_group)
+            module, hidden_states, router_fn=router_fn, ep_group=ep_group, **options)
         return combine(module, hidden_states, routed)
 
     return compute_fn

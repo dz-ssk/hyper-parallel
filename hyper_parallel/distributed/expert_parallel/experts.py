@@ -98,6 +98,18 @@ def resolve_swiglu_weights(
     return w_gate, w_up, w_down
 
 
+def _expert_argsort(indices: torch.Tensor, key_upper_bound: int, use_fp32: bool = False) -> torch.Tensor:
+    """Optionally sort bounded, non-negative integer expert keys as FP32 on NPU.
+
+    Callers establish the exclusive key bound from the expert topology without
+    reading device values. Equal-key order may differ from integer argsort,
+    changing floating-point accumulation order despite exact key conversion.
+    """
+    if use_fp32 and indices.device.type == "npu" and 0 < key_upper_bound <= 2**24:
+        return indices.float().argsort()
+    return indices.argsort()
+
+
 def _local_swiglu_expert_forward(experts, dispatched_states, local_expert_indices):
     """Compute dispatched tokens with the local stacked SwiGLU experts.
 
@@ -106,7 +118,9 @@ def _local_swiglu_expert_forward(experts, dispatched_states, local_expert_indice
     the parent MoE forward, allows nested FSDP forward hooks to unshard and
     reshard expert parameters around the local computation.
     """
-    token_order = local_expert_indices.argsort()
+    token_order = _expert_argsort(
+        local_expert_indices, experts.local_expert_count, getattr(experts, "ep_sort_in_fp32", False)
+    )
     sorted_states = dispatched_states[token_order]
     local_expert_counts = torch.bincount(
         local_expert_indices,
@@ -243,6 +257,7 @@ def _prepare_ep_dispatch(
     global_expert_count: int,
     ep_size: int,
     ep_group: Any,
+    sort_in_fp32: bool = False,
 ) -> _EPDispatch:
     """Sort routed tokens and exchange per-rank dispatch counts."""
     flattened_states = hidden_states.reshape(-1, hidden_states.shape[-1])
@@ -254,7 +269,11 @@ def _prepare_ep_dispatch(
         token_count, device=flattened_states.device
     ).repeat_interleave(experts_per_token)
     destination_ranks = torch.div(expert_indices, local_expert_count, rounding_mode="floor")
-    dispatch_order = (destination_ranks * global_expert_count + expert_indices).argsort()
+    dispatch_order = _expert_argsort(
+        destination_ranks * global_expert_count + expert_indices,
+        ep_size * global_expert_count,
+        sort_in_fp32,
+    )
     dispatched_states = flattened_states[source_indices[dispatch_order]].contiguous()
     dispatched_indices = expert_indices[dispatch_order].unsqueeze(-1).contiguous()
     send_counts_tensor = torch.bincount(destination_ranks, minlength=ep_size)
@@ -314,6 +333,7 @@ def ep_routed_forward(
     *,
     router_fn: Callable,
     ep_group: Any,
+    sort_in_fp32: bool = False,
 ) -> torch.Tensor:
     """Routed-experts pipeline: SP-in (local chunk) -> all communication
     inside -> SP-out. **Routed branch only.**
@@ -349,6 +369,9 @@ def ep_routed_forward(
     ``router_fn`` is supplied BY THE CALLER (explicit choice, e.g. an entry
     of MOE_ROUTER_ADAPTERS picked by name in the factory code).
 
+    ``sort_in_fp32`` opts into FP32 dispatch keys on NPU when the topology
+    guarantees exact representation. Equal-key token order may change.
+
     Extended EP group = the ep axis of the derived expert mesh (flatten
     ep_size consecutive ranks: first span the TP group, then extend to
     adjacent dp/cp ranks; MindSpeed TP-extend-EP / Megatron etp=1 + ep
@@ -372,6 +395,7 @@ def ep_routed_forward(
         global_expert_count=global_expert_count,
         ep_size=ep_size,
         ep_group=ep_group,
+        sort_in_fp32=sort_in_fp32,
     )
     combined_expert_outputs = _run_ep_local_experts(
         module,

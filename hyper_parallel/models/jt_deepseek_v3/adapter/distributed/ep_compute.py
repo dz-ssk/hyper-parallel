@@ -45,6 +45,7 @@ def jt_deepseek_v3_ep_compute_fn(*, module: Any, mesh: Any, tp_mesh: Any, cp_mes
         expected_attrs=["gate", "experts", "shared_experts", "config"],
         combine=module.combine_routed,
         use_grouped_gemm=True,
+        sort_in_fp32=getattr(module.config, "expert_sort_fp32", False),
     )
     module.ep_compute = partial(executor, module)
     return type(module).forward

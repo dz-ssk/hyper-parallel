@@ -56,6 +56,18 @@ class JTDeepseekV3Config(DeepseekV32Config):
 
     model_type = "jt_deepseek_v3"
 
+    def __init__(self, *, expert_sort_fp32: bool = False, **kwargs: Any) -> None:
+        """Configure optional FP32 expert-key sorting without changing activation precision.
+
+        Args:
+            expert_sort_fp32: Use bounded FP32 keys for NPU EP sorting; defaults to false.
+            **kwargs: DeepSeek model configuration fields.
+        """
+        if not isinstance(expert_sort_fp32, bool):
+            raise ValueError("expert_sort_fp32 must be a boolean")
+        super().__init__(**kwargs)
+        self.expert_sort_fp32 = expert_sort_fp32
+
 
 AutoConfig.register(JTDeepseekV3Config.model_type, JTDeepseekV3Config, exist_ok=True)
 
