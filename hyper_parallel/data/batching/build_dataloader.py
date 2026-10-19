@@ -86,6 +86,20 @@ def _is_iterable_dataset(dataset: Any) -> bool:
     return is_iterable
 
 
+def _drop_global_tail_enabled(dataloader_target: Any) -> bool:
+    """Validate the opt-in tail policy before constructing any Dataset reader."""
+    drop_global_tail = getattr(dataloader_target, "drop_last_global_batch", False)
+    if not isinstance(drop_global_tail, bool):
+        raise ValueError("drop_last_global_batch must be a bool")
+    if drop_global_tail:
+        loader_class = dataloader_target.callable
+        if not isinstance(loader_class, type) or not issubclass(loader_class, FixedBatchDataLoader):
+            raise ValueError("drop_last_global_batch requires a FixedBatchDataLoader target")
+        if not getattr(dataloader_target, "drop_last", True):
+            raise ValueError("drop_last_global_batch requires drop_last=True")
+    return drop_global_tail
+
+
 def build_dataloader(
         dataloader_target: Any,
         *,
@@ -125,6 +139,8 @@ def build_dataloader(
     if dataloader_target is None:
         raise ValueError("dataloader_target must define a build target")
 
+    drop_global_tail = _drop_global_tail_enabled(dataloader_target)
+
     dataloaders: list[Any | None] = [None] * len(datasets)
     batch_samplers: list[Any | None] = [None] * len(datasets)
 
@@ -134,6 +150,9 @@ def build_dataloader(
             continue
 
         batch_sampler = None
+        drop_split_tail = drop_global_tail and split_name == "train"
+        if drop_split_tail and _is_iterable_dataset(dataset):
+            raise ValueError("drop_last_global_batch requires a mapping-style training Dataset")
         if not _is_iterable_dataset(dataset):
             batch_sampler = build_dataset_batch_sampler(
                 total_samples=len(dataset),
@@ -146,6 +165,7 @@ def build_dataloader(
                 sampler_type=getattr(dataloader_target, "sampler_type", "single"),
                 data_sharding=getattr(dataloader_target, "data_sharding", False),
                 seed=training_config.seed if training_config.seed is not None else default_seed,
+                drop_last_global_batch=drop_split_tail,
             )
 
         dataloaders[split_index] = dataloader_target.build(
@@ -157,6 +177,7 @@ def build_dataloader(
             dp_world_size=mesh_context.dp_size,
             max_seq_len=max_seq_len,
             seed=training_config.seed if training_config.seed is not None else default_seed,
+            **({"drop_last_global_batch": drop_split_tail} if drop_global_tail else {}),
         )
         logger.debug(
             "Built DataLoader split=%s, dataset=%s, batch_sampler=%s",
@@ -171,7 +192,11 @@ def build_dataloader(
 
 
 class FixedBatchDataLoader(StatefulDataLoader):
-    """Build fixed-sample batches while retaining Trainer iterator policy."""
+    """Build fixed-sample batches while retaining Trainer iterator policy.
+
+    ``drop_last_global_batch`` requires a matching sampler. Trainer construction
+    enables it only for the training split; validation and test keep their policy.
+    """
 
     def __init__(
             self,
@@ -181,6 +206,7 @@ class FixedBatchDataLoader(StatefulDataLoader):
             *,
             batch_size: int | None = None,
             drop_last: bool = True,
+            drop_last_global_batch: bool = False,
             sampler_type: str = "single",
             num_workers: int = 0,
             seed: int = 1234,
@@ -190,8 +216,15 @@ class FixedBatchDataLoader(StatefulDataLoader):
         """Initialize the stateful DataLoader."""
         if sampler_type not in ("single", "cyclic"):
             raise ValueError("sampler_type must be 'single' or 'cyclic'")
+        if not isinstance(drop_last_global_batch, bool):
+            raise ValueError("drop_last_global_batch must be a bool")
+        if drop_last_global_batch and (
+                not drop_last or not getattr(batch_sampler, "drop_last_global_batch", False)
+        ):
+            raise ValueError("drop_last_global_batch requires drop_last=True and a matching batch_sampler")
 
         self.drop_last = drop_last
+        self.drop_last_global_batch = drop_last_global_batch
         self.sampler_type = sampler_type
         generator = torch.Generator().manual_seed(seed)
         worker_options = {

@@ -58,6 +58,7 @@ class _DatasetBatchSampler:
             dp_world_size: int,
             drop_last: bool,
             index_mapping: IndexMapping | None,
+            drop_last_global_batch: bool = False,
     ) -> None:
         """Validate and store DP slicing and checkpoint state."""
         _validate_positive_integer(total_samples, "total_samples")
@@ -73,6 +74,9 @@ class _DatasetBatchSampler:
         self.dp_rank = dp_rank
         self.dp_world_size = dp_world_size
         self.drop_last = drop_last
+        if not isinstance(drop_last_global_batch, bool) or (drop_last_global_batch and not drop_last):
+            raise ValueError("drop_last_global_batch must be a bool and requires drop_last=True")
+        self.drop_last_global_batch = drop_last_global_batch
         self.index_mapping = index_mapping
         self.global_micro_batch_size = micro_batch_size * dp_world_size
         _validate_positive_integer(global_batch_size, "global_batch_size")
@@ -91,12 +95,13 @@ class _DatasetBatchSampler:
 
     def __iter__(self) -> Iterator[list[int]]:
         """Yield sequential rank-local indices for ``single`` mode."""
-        while self.consumed_samples < self.total_samples:
+        stop = self._optimizer_step_stop(self.total_samples)
+        while self.consumed_samples < stop:
             block_start = self.consumed_samples
-            block_stop = min(block_start + self.global_micro_batch_size, self.total_samples)
+            block_stop = min(block_start + self.global_micro_batch_size, stop)
             block_size = block_stop - block_start
             if self.drop_last and block_size < self.global_micro_batch_size:
-                self.consumed_samples = self.total_samples
+                self.consumed_samples = stop
                 break
 
             local_start = block_start + self.dp_rank * self.micro_batch_size
@@ -113,11 +118,17 @@ class _DatasetBatchSampler:
 
     def __len__(self) -> int:
         """Return the remaining number of micro-batches for this DP rank."""
-        remaining_samples = self.total_samples - self.consumed_samples
+        remaining_samples = max(0, self._optimizer_step_stop(self.total_samples) - self.consumed_samples)
         full_batches, partial_samples = divmod(remaining_samples, self.global_micro_batch_size)
         if self.drop_last or partial_samples <= self.dp_rank * self.micro_batch_size:
             return full_batches
         return full_batches + 1
+
+    def _optimizer_step_stop(self, active_samples: int) -> int:
+        """Truncate after shuffling so retained samples keep their original order."""
+        if self.drop_last_global_batch:
+            return active_samples - active_samples % self.global_batch_size
+        return active_samples
 
     def _resolve_index(self, logical_index: int) -> int:
         """Apply an optional logical-to-physical sample index mapping."""
@@ -139,6 +150,8 @@ class _DatasetBatchSampler:
             "global_batch_size": self.global_batch_size,
             "dp_world_size": self.dp_world_size,
         }
+        if self.drop_last_global_batch:
+            sampler_state["drop_last_global_batch"] = True
         return sampler_state
 
     def enable_source_batch_resume(self) -> None:
@@ -154,6 +167,8 @@ class _DatasetBatchSampler:
         Raises:
             ValueError: If the checkpoint does not contain a valid sample position.
         """
+        if state_dict.get("drop_last_global_batch", False) != self.drop_last_global_batch:
+            raise ValueError("sampler resume requires an unchanged drop_last_global_batch policy")
         consumed_samples = state_dict["consumed_samples"]
         self._validate_consumed_samples(consumed_samples, self.total_samples)
         if state_dict["global_batch_size"] != self.global_batch_size:
@@ -217,12 +232,13 @@ class _CyclicDatasetBatchSampler(_DatasetBatchSampler):
     def __len__(self) -> int:
         """Return the number of local micro-batches remaining in this epoch."""
         active_samples = self._active_samples()
-        remaining_samples = active_samples - self.consumed_samples
+        remaining_samples = max(0, self._optimizer_step_stop(active_samples) - self.consumed_samples)
         return remaining_samples // self.global_micro_batch_size
 
     def __iter__(self) -> Iterator[list[int]]:
         """Build the current epoch permutation and DP slices."""
         active_samples = self._active_samples()
+        stop = self._optimizer_step_stop(active_samples)
         if self.consumed_samples % self.global_micro_batch_size != 0:
             raise ValueError("cyclic consumed_samples must align to a distributed micro-batch")
 
@@ -249,6 +265,8 @@ class _CyclicDatasetBatchSampler(_DatasetBatchSampler):
 
         local_batch = []
         for index in rank_indices:
+            if self.consumed_samples >= stop:
+                break
             local_batch.append(index)
             if len(local_batch) == self.micro_batch_size:
                 self.consumed_samples += self.global_micro_batch_size
@@ -258,7 +276,7 @@ class _CyclicDatasetBatchSampler(_DatasetBatchSampler):
     def _active_samples(self) -> int:
         """Return the complete global micro-batch region reused every epoch."""
         active_samples = self.total_samples - self.total_samples % self.global_micro_batch_size
-        if active_samples <= 0:
+        if active_samples <= 0 and not self.drop_last_global_batch:
             raise ValueError("cyclic Dataset must contain one complete global micro-batch")
 
         return active_samples
@@ -295,6 +313,7 @@ def build_dataset_batch_sampler(
         sampler_type: SamplerType = "single",
         data_sharding: bool = False,
         seed: int = 0,
+        drop_last_global_batch: bool = False,
 ) -> _DatasetBatchSampler:
     """Build a Dataset batch sampler.
 
@@ -324,6 +343,10 @@ def build_dataset_batch_sampler(
         data_sharding: Whether cyclic sampling shuffles an independent
             contiguous bucket on each DP rank.
         seed: Base seed used by cyclic epoch shuffling.
+        drop_last_global_batch: Drop incomplete optimizer batches before loading
+            samples, preserving the existing epoch permutation. Requires drop_last.
+            Use only when source samples map to fixed-size training micro-batches;
+            dynamic token packing does not preserve that correspondence.
 
     Returns:
         A resumable iterable of rank-local index lists.
@@ -344,6 +367,7 @@ def build_dataset_batch_sampler(
         "dp_world_size": dp_world_size,
         "drop_last": drop_last,
         "index_mapping": resolved_mapping,
+        "drop_last_global_batch": drop_last_global_batch,
     }
 
     if sampler_type == "single":
