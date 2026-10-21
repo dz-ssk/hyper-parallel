@@ -82,11 +82,75 @@ class TestCompleteModel(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "No auxiliary loss"):
             moe.pop_auxiliary_loss()
 
+    def test_sequence_auxiliary_loss_ignores_dispatch_bias_and_group_filter(self) -> None:
+        """The sequence objective uses raw affinities while bias counts track actual dispatch."""
+        logits = torch.tensor([[2, 1, -1, -2], [1.8, .9, -.8, -1.5], [-.5, 1.3, 2, -1]])
+        scores = logits.double().sigmoid()
+        # These fixed logits select {0, 1}, {0, 1}, {1, 2} without dispatch corrections.
+        load = torch.tensor([2, 3, 1, 0], dtype=torch.float64) / 6
+        denominator = scores.sum(-1, keepdim=True)
+        projection = (scores * load).sum(-1, keepdim=True)
+        coefficient = 1e-4
+        expected_loss = coefficient * 4 * (load * (scores / denominator).mean(0)).sum()
+        expected_gradient = coefficient * 4 / 3 * scores * (1 - scores) * (
+            load * denominator - projection) / denominator.square()
+
+        for groups in (1, 2):
+            for use_padding in (False, True):
+                with self.subTest(groups=groups, use_padding=use_padding):
+                    config = small_config()
+                    config.n_group = groups
+                    config.topk_group = 1
+                    config.use_pad_tokens = use_padding
+                    config.moe_aux_loss_coeff = coefficient
+                    module = JTDeepseekV3MoE(config)
+                    with torch.no_grad():
+                        module.gate.weight.zero_()
+                        module.gate.weight[:, :4].copy_(torch.eye(4))
+                    dispatches = []
+                    loads = []
+                    for bias in (torch.zeros(4), torch.tensor([-1., -1., 1., 1.])):
+                        module.tokens_per_expert = None
+                        with torch.no_grad():
+                            module.gate.e_score_correction_bias.copy_(bias)
+                        hidden = torch.zeros(1, module.padding + 3, 16, requires_grad=True)
+                        with torch.no_grad():
+                            hidden[0, module.padding:, :4].copy_(logits)
+                        indices, weights = module.route(hidden)
+                        loss = module.pop_auxiliary_loss()
+                        hidden_gradient, weight_gradient = torch.autograd.grad(loss, (hidden, module.gate.weight))
+                        torch.testing.assert_close(loss.double(), expected_loss, rtol=0, atol=1e-10)
+                        torch.testing.assert_close(hidden_gradient[0, module.padding:, :4].double(),
+                                                   expected_gradient, rtol=0, atol=1e-11)
+                        expected_weight = expected_gradient.T @ hidden.detach()[0, module.padding:].double()
+                        torch.testing.assert_close(weight_gradient.double(), expected_weight, rtol=0, atol=5e-11)
+                        padding_gradient = hidden_gradient[0, :module.padding]
+                        torch.testing.assert_close(padding_gradient, torch.zeros_like(padding_gradient), rtol=0, atol=0)
+                        selected = indices[module.padding:]
+                        counts = torch.bincount(selected.flatten(), minlength=4).float()
+                        torch.testing.assert_close(module.tokens_per_expert, counts, rtol=0, atol=0)
+                        torch.testing.assert_close(weights[:module.padding],
+                                                   torch.zeros_like(weights[:module.padding]), rtol=0, atol=0)
+                        uncorrected = logits.sigmoid().gather(-1, selected)
+                        expected_weights = uncorrected / uncorrected.sum(-1, keepdim=True)
+                        torch.testing.assert_close(weights[module.padding:], expected_weights, rtol=1e-6, atol=1e-7)
+                        module.update_expert_bias(lr=.001)
+                        torch.testing.assert_close(module.gate.e_score_correction_bias,
+                                                   bias + (counts.mean() - counts).sign() * .001, rtol=0, atol=0)
+                        dispatches.append(selected.sort(-1).values)
+                        loads.append(counts)
+                    self.assertFalse(torch.equal(*dispatches),
+                                     f"Dispatch must respond to bias: first={dispatches[0]}, second={dispatches[1]}")
+                    self.assertFalse(torch.equal(*loads),
+                                     f"Bias counts must track dispatch: first={loads[0]}, second={loads[1]}")
+
     @patch("hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3.npu_grouped_swiglu")
     def test_checkpoint_auxiliary_loss_consumption_matches_eager_gradients(self, grouped_swiglu):
         """Trunk and MTP replay preserve accumulated gradients without leaving loss references."""
         # Use differentiable CPU experts to exercise graph lifetime without the NPU-only kernel.
-        def cpu_experts(inputs, gate_up_weight, down_weight, counts):
+        def cpu_experts(inputs: torch.Tensor, gate_up_weight: torch.Tensor,
+                        down_weight: torch.Tensor, counts: torch.Tensor) -> torch.Tensor:
+            """Evaluate the expert branches with differentiable CPU operations."""
             outputs = []
             for index, tokens in enumerate(inputs.split(counts.tolist())):
                 gate, up = F.linear(tokens, gate_up_weight[index]).chunk(2, dim=-1)

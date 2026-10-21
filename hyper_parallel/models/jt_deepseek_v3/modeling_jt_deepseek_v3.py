@@ -450,7 +450,9 @@ class JTDeepseekV3MoE(DeepseekV32MoE):
         hidden = hidden[:, padding:]
         indices, selected = MOE_ROUTER_ADAPTERS["deepseekv3"](self, hidden)
         scores = self.gate.pop_router_logits().sigmoid()
-        auxiliary_loss = self.routing_statistics(indices, scores)
+        # The sequence objective measures raw affinities, independently of dispatch bias and group filtering.
+        auxiliary_indices = scores.topk(indices.shape[-1], dim=-1, sorted=False).indices
+        auxiliary_loss = self.routing_statistics(auxiliary_indices, scores)
         # Replay must keep the same tensor operations without retaining its graph on the module.
         if not is_recomputing():
             self.auxiliary_loss = auxiliary_loss
@@ -484,7 +486,7 @@ class JTDeepseekV3MoE(DeepseekV32MoE):
         """Compute the sequence objective separately from step-level router counts.
 
         Args:
-            indices: Selected expert indices for the real, unpadded tokens.
+            indices: Unbiased affinity TopK indices for the real, unpadded tokens.
             scores: Router affinities before top-k normalization.
         """
         return calculate_seq_aux_loss(scores, indices, coeff=self.config.moe_aux_loss_coeff,

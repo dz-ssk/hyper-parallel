@@ -77,7 +77,9 @@ def calculate_seq_aux_loss(
             for example sigmoid scores before top-k selection; leading dimensions
             index independent sequences, and a 2-D input is one sequence.
         selected_experts: Selected expert indices, ``[..., tokens, top_k]``, with the
-            same leading dimensions as ``scores``.
+            same leading dimensions as ``scores``. For the DeepSeek-V3 sequence
+            objective, select from the raw affinities without dispatch bias or
+            group filtering; dispatch statistics remain a separate objective.
         coeff: Aux loss coefficient.
         sequence_partition_group: Optional process group whose ranks hold different
             token shards of the same sequences; ``None`` keeps the statistics local.
