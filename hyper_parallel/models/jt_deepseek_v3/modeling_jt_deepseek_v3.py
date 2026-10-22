@@ -429,7 +429,7 @@ class JTDeepseekV3MoE(DeepseekV32MoE):
             config, intermediate_size=config.moe_intermediate_size * config.n_shared_experts)
         # Ranks holding shards of the same sequences (TP with sequence parallelism); the JT builder sets it.
         self.sequence_partition_group = None
-        # Auxiliary gradients also average TP replicas when sequence parallelism is off.
+        # TP group averaging the auxiliary loss when the loss is TP-parallel; the JT builder sets it.
         self.auxiliary_loss_group = None
         self.ep_compute = self.local_routed_forward
         self.auxiliary_loss = None

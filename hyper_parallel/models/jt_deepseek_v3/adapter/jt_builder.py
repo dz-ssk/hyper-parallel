@@ -94,13 +94,16 @@ def _bind_statistics_groups(model: PreTrainedModel, mesh: Any) -> None:
     model.qk_clip_group = replica_group
     model.loss_sequence_parallel_size = mesh.tp_size if mesh.sequence_parallel else 1
     model.loss_tp_mesh = mesh.device_mesh["tp"] if mesh.loss_parallel else None
-    # Bias updates sum unique token counts; auxiliary gradients must also average TP replicas.
+    # Bias updates sum unique token counts.
     model.expert_load_group = replica_group
     sequence_group = mesh.device_mesh["tp"].get_group() if mesh.sequence_parallel and mesh.tp_size > 1 else None
+    # Every TP rank routes the same gathered tokens. Without loss parallelism FSDP already divides gradients by
+    # these TP loss replicas, so averaging the auxiliary loss over TP as well would halve its gradient.
+    auxiliary_group = mesh.device_mesh["tp"].get_group() if mesh.tp_size > 1 and mesh.loss_parallel else None
     for module in model.modules():
         if isinstance(module, JTDeepseekV3MoE):
             module.sequence_partition_group = sequence_group
-            module.auxiliary_loss_group = mesh.device_mesh["tp"].get_group() if mesh.tp_size > 1 else None
+            module.auxiliary_loss_group = auxiliary_group
 
 
 def build_jt_model(*, config: dict[str, Any], reference_weights: str | Path | None = None,

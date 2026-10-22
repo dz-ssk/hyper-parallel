@@ -37,6 +37,7 @@ from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import (
     JTDeepseekV3Attention, observed_fusion_attention,
 )
 from hyper_parallel.models.jt_deepseek_v3.adapter.runtime import jt_optimizer
+from tests.common.mark_utils import arg_mark
 
 
 class TestJTContextParallel(unittest.TestCase):
@@ -160,45 +161,57 @@ class TestJTContextParallel(unittest.TestCase):
         expected = torch.tensor([0.25, 0.25, 0.8, 0.8, 0.8, 0.8])[:, None].expand(-1, 3)
         torch.testing.assert_close(parameter.value, expected)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_auxiliary_loss_matches_global_router_gradient(self):
-        """The public sequence mean and root CP sum retain the whole-sequence derivative."""
+        """Feature: CP sequence aux-loss gradient.
+
+        Description: Split one sequence over CP2 and repeat each shard on every TP rank, because the MoE input is
+            gathered over TP. Sum the per-rank router gradients as the root CP sum and the TP reduction do, then
+            divide by TP unless the loss is TP-parallel, as FSDP does.
+        Expectation: The aux value and the reduced router gradient equal the whole-sequence values.
+        """
         torch.manual_seed(5)
         hidden = torch.randn(16, 3, dtype=torch.float64)
         indices = torch.randn(16, 8).topk(2, dim=-1).indices
         counts = torch.bincount(indices.flatten(), minlength=8).float()
         frequency = counts / counts.sum()
         module = SimpleNamespace(config=SimpleNamespace(moe_aux_loss_coeff=0.01))
-        for tp_partitions, sequence_parallel in ((1, False), (2, True), (2, False)):
-            degree, world = 2, 2 * tp_partitions
+        degree = 2
+        for tp_size, loss_parallel in ((1, False), (2, False), (2, True)):
+            group_sizes = {"cp": degree, "sequence": degree * tp_size}
             weight = torch.randn(3, 8, dtype=torch.float64, requires_grad=True)
             scores = (hidden @ weight).sigmoid()
             expected = (scores / scores.sum(-1, keepdim=True)).mean(0).mul(frequency).sum() * 0.08
             cp_mesh = SimpleNamespace(get_group=lambda: "cp", size=lambda: degree, get_local_rank=lambda: 0)
             joint_mesh = SimpleNamespace(_flatten=lambda: SimpleNamespace(get_group=lambda: "sequence"))
-            mesh = SimpleNamespace(cp_mesh=cp_mesh, sequence_parallel=sequence_parallel,
+            mesh = SimpleNamespace(cp_mesh=cp_mesh, loss_parallel=loss_parallel,
                                    device_mesh={("cp", "tp"): joint_mesh})
             context = _JTTrainingContext(torch.nn.Identity(), mesh)
-            contributions = []
-            partitions = world if sequence_parallel else degree
-            local_inputs = list(zip(scores.chunk(partitions), indices.chunk(partitions)))
-            if not sequence_parallel:
-                local_inputs = [item for item in local_inputs for _replica in range(tp_partitions)]
+            shards = zip(scores.chunk(degree), indices.chunk(degree))
+            local_inputs = [shard for shard in shards for _replica in range(tp_size)]
 
-            def reduce(tensor: torch.Tensor, **kwargs: Any) -> None:
-                """Provide global fractions and verify that TP replicas participate."""
-                self.assertEqual(kwargs["group"], "sequence")
-                tensor.copy_(frequency * world if tensor.ndim == 2 else expected.detach() * world)
+            def reduce(tensor: torch.Tensor, *, group: str, joint_size: int = group_sizes["sequence"],
+                       target: torch.Tensor = expected.detach(), **_kwargs: Any) -> None:
+                """Provide the global fractions and loss summed over the requested group."""
+                size = joint_size if group == "sequence" else degree
+                tensor.copy_(frequency * size if tensor.ndim == 2 else target * size)
 
             with patch("hyper_parallel.components.losses.moe_aux.dist.all_reduce", side_effect=reduce), patch(
-                    "hyper_parallel.components.losses.moe_aux.dist.get_world_size", return_value=world):
-                for local_score, local_index in local_inputs:
-                    contributions.append(context.routing_statistics(module, local_index, local_score))
+                    "hyper_parallel.components.losses.moe_aux.dist.get_world_size", side_effect=group_sizes.get):
+                contributions = [context.routing_statistics(module, local_index, local_score)
+                                 for local_score, local_index in local_inputs]
             total = sum(contributions)
-            torch.testing.assert_close(total.detach() / tp_partitions, expected.detach())
-            actual_gradient = torch.autograd.grad(total, weight, retain_graph=True)[0]
+            torch.testing.assert_close(total.detach() / tp_size, expected.detach())
+            # FSDP divides the TP replicas' summed gradients by TP unless the loss is TP-parallel.
+            divisor = 1 if loss_parallel else tp_size
+            actual_gradient = torch.autograd.grad(total, weight, retain_graph=True)[0] / divisor
             expected_gradient = torch.autograd.grad(expected, weight)[0]
             self.assertGreater(expected_gradient.norm().item(), 1e-8)
-            torch.testing.assert_close(actual_gradient, expected_gradient, rtol=1e-7, atol=1e-12)
+            torch.testing.assert_close(
+                actual_gradient, expected_gradient, rtol=1e-7, atol=1e-12,
+                msg=f"tp_size={tp_size}, loss_parallel={loss_parallel}: "
+                    f"actual={actual_gradient}, expected={expected_gradient}",
+            )
 
 
     def test_packed_mtp_stops_at_each_document_for_two_depths(self):
