@@ -24,7 +24,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
-from hyper_parallel.components.optim.builders import Muon
+from hyper_parallel.components.optim.builders import AdamW, Muon
 from hyper_parallel.core.utils.moe_utils import sync_and_update_expert_bias
 from hyper_parallel.core.dtensor.dtensor import DTensor, distribute_tensor
 from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import (
@@ -121,10 +121,8 @@ def clip_qk(model: torch.nn.Module, threshold: float) -> None:
 
 
 @torch.no_grad()
-def _after_update(model: torch.nn.Module, threshold: float, optimizer: Any, args: tuple, kwargs: dict) -> None:
-    """Clip the QK projections and update the routing biases after an optimizer step."""
-    del optimizer, args, kwargs
-    clip_qk(model, threshold)
+def _update_expert_bias(model: torch.nn.Module) -> None:
+    """Synchronize expert counts and apply the JT bias update once per optimizer step."""
     config = model.config
     if config.moe_router_enable_expert_bias:
         for module in model.modules():
@@ -132,6 +130,14 @@ def _after_update(model: torch.nn.Module, threshold: float, optimizer: Any, args
                 sync_and_update_expert_bias(
                     module, lr=config.moe_router_bias_update_rate,
                     tp_group=module.sequence_partition_group, dp_group=model.expert_load_group)
+
+
+@torch.no_grad()
+def _after_update(model: torch.nn.Module, threshold: float, optimizer: Any, args: tuple, kwargs: dict) -> None:
+    """Clip the QK projections and update the routing biases after an optimizer step."""
+    del optimizer, args, kwargs
+    clip_qk(model, threshold)
+    _update_expert_bias(model)
 
 
 def build_optimizer(*, model: torch.nn.Module, qk_clip_threshold: float, **kwargs: Any) -> Muon:
@@ -156,4 +162,18 @@ def build_optimizer(*, model: torch.nn.Module, qk_clip_threshold: float, **kwarg
     })
     optimizer = builder.get_optimizer()
     optimizer.chained_optimizers[-1].register_step_post_hook(partial(_after_update, model, qk_clip_threshold))
+    return builder
+
+
+@torch.no_grad()
+def _after_adamw_update(model: torch.nn.Module, optimizer: Any, args: tuple, kwargs: dict) -> None:
+    """Update expert load-balancing bias after native AdamW, without Muon QK clipping."""
+    del optimizer, args, kwargs
+    _update_expert_bias(model)
+
+
+def build_adamw(*, model: torch.nn.Module, **kwargs: Any) -> AdamW:
+    """Use the public AdamW builder and attach the model's expert-bias update."""
+    builder = AdamW(model=model, **kwargs)
+    builder.get_optimizer().chained_optimizers[-1].register_step_post_hook(partial(_after_adamw_update, model))
     return builder

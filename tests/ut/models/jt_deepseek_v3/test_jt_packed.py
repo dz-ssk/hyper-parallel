@@ -28,7 +28,9 @@ from torch.utils.checkpoint import DefaultDeviceType
 from hyper_parallel.components.losses.chunked_cross_entropy import projected_cross_entropy
 from hyper_parallel.distributed.activation_checkpoint import _apply_activation_checkpointing
 from hyper_parallel.models.jt_deepseek_v3.adapter.distributed.context_parallel import _JTTrainingContext
-from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import JTDeepseekV3ForCausalLM, JTDeepseekV3MoE
+from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import (
+    JTDeepseekV3ForCausalLM, JTDeepseekV3MoE,
+)
 from tests.ut.models.jt_deepseek_v3.test_modeling_jt_deepseek_v3 import small_config
 
 
@@ -53,28 +55,41 @@ class TestJTPacked(unittest.TestCase):
             "hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3.npu_grouped_swiglu",
             side_effect=reference_grouped_swiglu))
 
-    def test_packed_lm_mtp_equal_independent_documents(self) -> None:
-        """Packed losses and gradients equal token-weighted independent document runs."""
+    def test_packed_lm_isolates_documents(self) -> None:
+        """Changing the preceding document must not change the supervised document's LM loss or gradients."""
         torch.manual_seed(8)
-        config = small_config()
-        config.moe_aux_loss_coeff = 0.0
-        config.num_nextn_predict_layers = 2
-        packed = JTDeepseekV3ForCausalLM(config)
-        separate = copy.deepcopy(packed)
+        model = JTDeepseekV3ForCausalLM(small_config())
+        tokens = torch.arange(1, 9).unsqueeze(0)
+        changed = tokens.clone()
+        changed[:, :4] = torch.tensor([[9, 10, 11, 12]])
+        labels = torch.tensor([[-100, -100, -100, -100, 6, 7, 8, -100]])
+        expected = model(tokens, labels, actual_seq_len=(4, 8)).loss["foundation_loss/lm"]
+        expected.backward()
+        gradients = {name: p.grad.clone() for name, p in model.named_parameters() if p.grad is not None}
+        model.zero_grad(set_to_none=True)
+        actual = model(changed, labels, actual_seq_len=(4, 8)).loss["foundation_loss/lm"]
+        actual.backward()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        torch.testing.assert_close(
+            {name: p.grad for name, p in model.named_parameters() if p.grad is not None},
+            gradients, rtol=0, atol=0)
+
+    def test_packed_mtp_preserves_reference_target_shift(self) -> None:
+        """Both projection paths preserve shifted labels without adding document-tail masks."""
         tokens = torch.arange(1, 9).unsqueeze(0)
         labels = torch.tensor([[2, 3, 4, -100, 6, 7, 8, -100]])
-        output = packed(tokens, labels, actual_seq_len=(4, 8)).loss
-        left = separate(tokens[:, :4], labels[:, :4]).loss
-        right = separate(tokens[:, 4:], labels[:, 4:]).loss
-        keys = ("foundation_loss/lm", "foundation_loss/mtp")
-        expected = {key: (left[key] + right[key]) / 2 for key in keys}
-        for key in keys:
-            torch.testing.assert_close(output[key], expected[key], rtol=2e-5, atol=2e-6)
-        sum(output[key] for key in keys).backward()
-        sum(expected.values()).backward()
-        torch.testing.assert_close(
-            {name: parameter.grad for name, parameter in packed.named_parameters()},
-            {name: parameter.grad for name, parameter in separate.named_parameters()}, rtol=3e-4, atol=2e-6)
+        expected = torch.tensor([[3, 4, -100, 6, 7, 8, -100, -100]])
+        for chunked in (False, True):
+            with self.subTest(chunked=chunked):
+                config = small_config()
+                config.num_nextn_predict_layers = 1
+                config.enable_chunk_loss = chunked
+                model = JTDeepseekV3ForCausalLM(config)
+                method = "_projection_loss" if chunked else "_token_loss"
+                with patch.object(model, method, wraps=getattr(model, method)) as loss:
+                    model(tokens, labels, actual_seq_len=(4, 8))
+                self.assertEqual(loss.call_count, 2)
+                torch.testing.assert_close(loss.call_args_list[1].args[1], expected, rtol=0, atol=0)
 
     def test_chunked_lm_mtp_preserves_packed_losses_and_gradients(self) -> None:
         """Feature: Chunk loss for packed LM and MTP objectives.

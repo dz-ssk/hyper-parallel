@@ -50,7 +50,8 @@ model:
     moe_router_bias_update_rate: 0.001
     enable_chunk_loss: true
     chunk_loss_size: 4096
-  reference_weights: /workspace/mf-weights/full-state-step300
+  # The public checkpointer restores model weights after construction.
+  reference_weights: null
 loss_fn:
   _target_: hyper_parallel.components.losses.ModelOutputLoss
 model_init_dtype: float32
@@ -103,11 +104,9 @@ plan_overrides:
     tp: replicate
 - match: '*.mlp.shared_experts'
   params:
-    gate_proj.weight:
+    linear_fc1.weight:
       tp: replicate
-    up_proj.weight:
-      tp: replicate
-    down_proj.weight:
+    linear_fc2.weight:
       tp: replicate
   in_src:
     x:
@@ -143,9 +142,27 @@ plan_overrides:
   region_dispatch: false
   local_compute_fn:
     _target_: hyper_parallel.models.jt_deepseek_v3.adapter.distributed.ep_compute.jt_deepseek_v3_ep_compute_fn
+- match:
+  - '*.input_layernorm'
+  - '*.post_attention_layernorm'
+  - model.norm
+  - mtp.layers.*.enorm
+  - mtp.layers.*.hnorm
+  - mtp.layers.*.final_layernorm
+  module_type: transformers.models.deepseek_v32.modeling_deepseek_v32.DeepseekV32RMSNorm
+  exact_type: true
+  replace_module:
+    _target_: hyper_parallel.components.modules.rms_norm.RMSNorm
+- match:
+  - model.layers.0.mlp
+  - '*.mlp.shared_experts'
+  module_type: transformers.models.deepseek_v32.modeling_deepseek_v32.DeepseekV32MLP
+  exact_type: true
+  replace_module:
+    _target_: hyper_parallel.components.modules.swiglu_mlp.SwiGLUMLP
 training:
-  train_iters: 600
-  lr_scheduler_iters: 1000
+  train_iters: 2200
+  lr_scheduler_iters: 4000
   max_grad_norm: 1.0
   global_batch_size: 1
   micro_batch_size: 1
@@ -165,6 +182,68 @@ fsdp_config:
     param_dtype: bfloat16
     reduce_dtype: float32
     cast_forward_inputs: false
+    # Exact FQNs for 2 decoder layers and 1 MTP layer; update this list when changing layer counts.
+    custom_params:
+      lm_head.weight:
+        param_dtype: float32
+        reduce_dtype: float32
+      model.embed_tokens.weight:
+        param_dtype: float32
+        reduce_dtype: float32
+      model.layers.0.input_layernorm.weight:
+        param_dtype: float32
+        reduce_dtype: float32
+      model.layers.0.post_attention_layernorm.weight:
+        param_dtype: float32
+        reduce_dtype: float32
+      model.layers.0.self_attn.kv_a_layernorm.weight:
+        param_dtype: float32
+        reduce_dtype: float32
+      model.layers.0.self_attn.q_a_layernorm.weight:
+        param_dtype: float32
+        reduce_dtype: float32
+      model.layers.1.input_layernorm.weight:
+        param_dtype: float32
+        reduce_dtype: float32
+      model.layers.1.mlp.gate.weight:
+        param_dtype: float32
+        reduce_dtype: float32
+      model.layers.1.post_attention_layernorm.weight:
+        param_dtype: float32
+        reduce_dtype: float32
+      model.layers.1.self_attn.kv_a_layernorm.weight:
+        param_dtype: float32
+        reduce_dtype: float32
+      model.layers.1.self_attn.q_a_layernorm.weight:
+        param_dtype: float32
+        reduce_dtype: float32
+      model.norm.weight:
+        param_dtype: float32
+        reduce_dtype: float32
+      mtp.layers.0.enorm.weight:
+        param_dtype: float32
+        reduce_dtype: float32
+      mtp.layers.0.final_layernorm.weight:
+        param_dtype: float32
+        reduce_dtype: float32
+      mtp.layers.0.hnorm.weight:
+        param_dtype: float32
+        reduce_dtype: float32
+      mtp.layers.0.transformer_layer.input_layernorm.weight:
+        param_dtype: float32
+        reduce_dtype: float32
+      mtp.layers.0.transformer_layer.mlp.gate.weight:
+        param_dtype: float32
+        reduce_dtype: float32
+      mtp.layers.0.transformer_layer.post_attention_layernorm.weight:
+        param_dtype: float32
+        reduce_dtype: float32
+      mtp.layers.0.transformer_layer.self_attn.kv_a_layernorm.weight:
+        param_dtype: float32
+        reduce_dtype: float32
+      mtp.layers.0.transformer_layer.self_attn.q_a_layernorm.weight:
+        param_dtype: float32
+        reduce_dtype: float32
 activation_checkpoint:
   mode: 'off'
 activation_swap: none
@@ -185,24 +264,16 @@ dataloader:
     _target_: hyper_parallel.data.batching.TextParallelBatch
     source_type: online
     attention_mode: compressed
-    reset_position_ids: true
+    # JT uses continuous RoPE positions; attention remains isolated by document boundaries.
+    reset_position_ids: false
     runtime_input_adapter:
       _target_: hyper_parallel.models.jt_deepseek_v3.adapter.data.runtime.JTSequenceRuntime
   sampler_type: single
   drop_last: true
   num_workers: 0
 optimizer:
-  _target_: hyper_parallel.models.jt_deepseek_v3.adapter.runtime.jt_optimizer.build_optimizer
+  _target_: hyper_parallel.models.jt_deepseek_v3.adapter.runtime.jt_optimizer.build_adamw
   fp32_main_params: true
-  muon_config:
-    lr: 0.0001
-    weight_decay: 0.1
-    momentum: 0.95
-    nesterov: true
-    ns_steps: 5
-    ns_variant: legacy
-    ns_epsilon: 1.0e-07
-    matched_adamw_rms: 0.2
   adamw_config:
     adamw_lr: 0.0001
     adamw_weight_decay: 0.1
@@ -210,7 +281,6 @@ optimizer:
     - 0.9
     - 0.95
     adamw_eps: 1.0e-08
-  qk_clip_threshold: 100.0
 lr_scheduler:
   _target_: hyper_parallel.components.optim.lr_scheduler.MultiLRScheduler
   lr_decay_style: constant
@@ -221,8 +291,10 @@ lr_scheduler:
     lr_decay_ratio: 1.0
 checkpoint:
   save_ckpt: false
-  checkpoint_dir: /workspace/outputs/checkpoints
-  restore_from: /workspace/mf-weights/native-step300/global_step_300
+  checkpoint_dir: /outputs/jt-longrun
+  # Use a Hyper-native checkpoint matching this model layout and AdamW optimizer.
+  # Set to null for a fresh run; train_iters is the target global step when resuming.
+  restore_from: /checkpoints/jt-native/global_step_300
   restore_optimizer: true
   restore_train_state: true
   restore_dataloader_state: true

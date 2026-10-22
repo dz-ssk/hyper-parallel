@@ -36,11 +36,13 @@ from transformers.models.deepseek_v32.modeling_deepseek_v32 import (
     DeepseekV32RotaryEmbedding, DeepseekV32TopkRouter,
 )
 
+from hyper_parallel.components.functional import moe_token_unpermute
 from hyper_parallel.components.losses import calculate_mtp_loss, calculate_seq_aux_loss
 from hyper_parallel.components.losses.mtp import iter_mtp_targets
 from hyper_parallel.components.losses.chunked_cross_entropy import projected_cross_entropy
 from hyper_parallel.components.modules.mtp import DeepseekV3MTP, shift_mtp_sequence
 from hyper_parallel.components.modules.mla_attention import MLAAttention
+from hyper_parallel.components.modules.rms_norm import RMSNorm
 from hyper_parallel.components.functional.npu_fusion_attention import (
     _attention_options, _prepare_attention_inputs, resolve_packed_sequence_lengths,
 )
@@ -198,6 +200,9 @@ class JTDeepseekV3MLAAttention(MLAAttention):
             context: Replacement context of the build pipeline.
         """
         super().__init__(module=module, module_fqn=module_fqn, context=context)
+        # Parent and child replacements cannot share a plan; MLA owns its fused latent norms.
+        self.q_a_layernorm = RMSNorm(module=self.q_a_layernorm)
+        self.kv_a_layernorm = RMSNorm(module=self.kv_a_layernorm)
         if not self.linear_qkv.weight.is_meta:
             with torch.no_grad():
                 self.linear_qkv.weight.copy_(torch.cat((module.q_a_proj.weight, module.kv_a_proj_with_mqa.weight)))
@@ -514,10 +519,11 @@ class JTDeepseekV3MoE(DeepseekV32MoE):
     def local_routed_forward(self, hidden: torch.Tensor) -> torch.Tensor:
         """Run the routed experts on this rank without expert parallelism.
 
-        Mirrors the EP pipeline on one rank: tokens are sorted by expert and computed by
-        :meth:`JTDeepseekV3Experts.forward_expert_major`, the routing weights are cast to the
-        activation dtype, and the weighted outputs are summed per token with ``index_add_``. The
-        routed output therefore does not depend on whether expert parallelism is enabled.
+        Tokens are grouped by expert for the public grouped SwiGLU kernel. The public
+        unpermute kernel combines them using the original FP32 routing probabilities;
+        no routing-probability cast or custom derivative is inserted. The public EP
+        path instead casts probabilities to the activation dtype and aggregates with
+        index_add_; enabling EP can therefore change floating-point results.
 
         Args:
             hidden: Pad-prefixed hidden states, ``[1, padding + tokens, hidden]``.
@@ -532,8 +538,12 @@ class JTDeepseekV3MoE(DeepseekV32MoE):
         sources = torch.arange(flat.shape[0], device=flat.device).repeat_interleave(indices.shape[1])[order]
         counts = expert_ids.new_zeros(self.experts.num_experts).scatter_add_(0, expert_ids, torch.ones_like(expert_ids))
         outputs = self.experts.forward_expert_major(flat[sources], counts)
-        weights = probabilities.reshape(-1).to(flat.dtype)[order].unsqueeze(-1)
-        return torch.zeros_like(flat).index_add_(0, sources, outputs * weights).reshape(hidden.shape)
+        if outputs.device.type == "npu":
+            inverse = order.argsort().to(torch.int32)
+            return moe_token_unpermute(outputs, inverse, probabilities).reshape(hidden.shape)
+        weights = probabilities.reshape(-1)[order].unsqueeze(-1)
+        combined = torch.zeros_like(flat, dtype=torch.float32).index_add_(0, sources, outputs.float() * weights)
+        return combined.to(hidden.dtype).reshape(hidden.shape)
 
     @staticmethod
     def combine_routed(owner: Any, hidden: torch.Tensor, routed: torch.Tensor) -> torch.Tensor:
@@ -620,6 +630,22 @@ class JTDeepseekV3Decoder(DeepseekV32DecoderLayer):
         return residual + branch
 
 
+class JTDeepseekV3Embedding(nn.Embedding):
+    """Token embedding with BF16 activations; parameter precision is managed by FSDP."""
+
+    def forward(self, values: torch.Tensor) -> torch.Tensor:
+        """Look up token embeddings and return BF16 activations."""
+        return super().forward(values).to(torch.bfloat16)
+
+
+class JTDeepseekV3LMHead(nn.Linear):
+    """Keep an FP32 master head while using the incoming activation dtype for GEMM."""
+
+    def forward(self, values: torch.Tensor) -> torch.Tensor:
+        """Project with native autograd through the weight cast."""
+        return F.linear(values, self.weight.to(values.dtype))
+
+
 class JTDeepseekV3Model(DeepseekV32Model):
     """DeepSeek-V3.2 base model built from JT decoder layers."""
 
@@ -631,7 +657,8 @@ class JTDeepseekV3Model(DeepseekV32Model):
         """
         DeepseekV32PreTrainedModel.__init__(self, config)
         self.padding_idx, self.vocab_size = config.pad_token_id, config.vocab_size
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        self.embed_tokens = JTDeepseekV3Embedding(
+            config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList([JTDeepseekV3Decoder(config, index) for index in range(config.num_hidden_layers)])
         self.norm = DeepseekV32RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.rotary_emb = DeepseekV32RotaryEmbedding(config=config)
@@ -663,7 +690,7 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
             raise ValueError("JT rotary computation currently requires rope_type='default'")
         self.model = JTDeepseekV3Model(config)
         self.vocab_size = config.vocab_size
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = JTDeepseekV3LMHead(config.hidden_size, config.vocab_size, bias=False)
         mtp_config = copy.deepcopy(config)
         depth = config.num_nextn_predict_layers
         mtp_config.mlp_layer_types = ["sparse"] * depth
@@ -770,7 +797,7 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
             input_ids: Token IDs, ``[1, sequence]``.
             labels: Targets already shifted by one token.
             loss_mask: Mask of the supervised targets.
-            position_ids: Optional sequence positions for RoPE.
+            position_ids: Compatibility input from the batch processor; JT derives continuous positions locally.
             actual_seq_len: Global cumulative ends of independent documents.
             sequence_start: Global offset of the local input interval.
 
@@ -791,22 +818,15 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
                 or sequence_start < 0 or sequence_start + sequence_length > ends[-1]):
             raise ValueError("JT cumulative document ends must increase and cover the local token interval")
         indices = torch.arange(sequence_start, sequence_start + sequence_length, device=input_ids.device)
-        sequence_end_mask = None
-        if len(ends) > 1:
-            boundaries = indices.new_tensor((0, *ends))
-            documents = torch.bucketize(indices, boundaries[1:], right=True)
-            sequence_end_mask = (indices + 1 == boundaries[documents + 1]).unsqueeze(0)
-            default_positions = indices - boundaries[documents]
-        else:
-            default_positions = indices
+        absolute_positions = indices.unsqueeze(0)
+        if position_ids is not None and position_ids.shape != input_ids.shape:
+            raise ValueError("JT position_ids must match input_ids")
+        # Derive continuous positions locally, including the offset of a CP slice.
+        position_ids = absolute_positions
         # NumPy FP32 inverse frequencies match MindFormers bitwise; torch.pow rounds some entries differently.
         dim = cfg.qk_rope_head_dim
         inverse = 1.0 / (cfg.rope_parameters["rope_theta"] ** (np.arange(0, dim, 2, dtype=np.float32) / dim))
         inverse = torch.from_numpy(inverse.astype(np.float32)).to(input_ids.device)
-        if position_ids is None:
-            position_ids = default_positions.unsqueeze(0)
-        if position_ids.shape != input_ids.shape:
-            raise ValueError("JT position_ids must match input_ids")
         frequency = position_ids.to(device=input_ids.device, dtype=torch.float32).unsqueeze(-1) * inverse
         frequency = torch.cat((frequency, frequency), dim=-1)
         hidden = self.model.embed_tokens(input_ids)
@@ -822,22 +842,20 @@ class JTDeepseekV3ForCausalLM(DeepseekV32ForCausalLM):
         normalized = self.model.norm(hidden)
         lm_loss = (self._projection_loss(normalized, targets) if self.enable_chunk_loss
                    else self._token_loss(self.lm_head(normalized), labels, loss_mask))
+        # Match the reference objective: shift across the pack and retain the supplied label mask.
         mtp_output = self.mtp(hidden, input_ids, embedding=self.model.embed_tokens,
                               head=None if self.enable_chunk_loss else self.lm_head,
-                              decoder_kwargs=attention_kwargs, shift_fn=self.shift_mtp_inputs,
-                              sequence_end_mask=sequence_end_mask)
+                              decoder_kwargs=attention_kwargs, shift_fn=self.shift_mtp_inputs)
         for layer in self.mtp.layers:
             auxiliary = auxiliary + layer.transformer_layer.mlp.pop_auxiliary_loss()
         shift_targets = partial(self.shift_mtp_inputs, pad_value=-100)
         if self.enable_chunk_loss:
             mtp_loss = torch.zeros_like(lm_loss)
             depths = len(mtp_output.prediction_hidden_states)
-            targets_by_depth = iter_mtp_targets(targets, depths, shift_fn=shift_targets,
-                                                sequence_end_mask=sequence_end_mask)
+            targets_by_depth = iter_mtp_targets(targets, depths, shift_fn=shift_targets)
             for prediction, future_targets in zip(mtp_output.prediction_hidden_states, targets_by_depth):
                 mtp_loss = mtp_loss + self._projection_loss(prediction, future_targets) * (cfg.mtp_loss_factor / depths)
         else:
             mtp_loss = calculate_mtp_loss(mtp_output.logits, targets, self._mtp_token_loss, vocab_size=cfg.vocab_size,
-                                          loss_factor=cfg.mtp_loss_factor, shift_fn=shift_targets,
-                                          sequence_end_mask=sequence_end_mask)
+                                          loss_factor=cfg.mtp_loss_factor, shift_fn=shift_targets)
         return {"lm_loss": lm_loss, "mtp_loss": mtp_loss, "aux_loss": auxiliary}

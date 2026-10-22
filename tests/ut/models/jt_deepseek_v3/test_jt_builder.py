@@ -24,6 +24,7 @@ from unittest.mock import patch
 import numpy as np
 import torch
 from torch.nn import functional as F
+import yaml
 
 from hyper_parallel.distributed.mesh import DistributedSetup
 from hyper_parallel.models.jt_deepseek_v3.adapter import jt_builder
@@ -32,7 +33,10 @@ from hyper_parallel.models.jt_deepseek_v3.modeling_jt_deepseek_v3 import (
     JTDeepseekV3ForCausalLM,
     JTDeepseekV3MLAAttention,
 )
+from hyper_parallel.components.modules.rms_norm import RMSNorm
+from hyper_parallel.components.modules.swiglu_mlp import SwiGLUMLP
 from hyper_parallel.trainer.config import entries_to_module_replacements
+from hyper_parallel.trainer.config.resolver import resolve_config
 from tests.common.jt_config import jt_test_config
 from tests.common.mark_utils import arg_mark
 
@@ -80,6 +84,30 @@ class TestJTBuilder(unittest.TestCase):
         """Build through the production entry with a caller-owned seed."""
         torch.manual_seed(seed)
         return jt_builder.build_jt_model(config=self.config, distributed_setup=self.setup, **options)
+
+    def test_recipes_replace_norms_and_preserve_shared_expert_layout(self) -> None:
+        """Both recipes replace latent norms and keep TP overrides consistent with actual shared-expert names."""
+        root = Path(__file__).resolve().parents[4]
+        for filename in ("hp_4k_1_card.yaml", "hp_4k_4_card.yaml"):
+            with self.subTest(recipe=filename):
+                document = yaml.safe_load((root / "examples/training_demo/jt_deepseek_v3" / filename).read_text())
+                recipe = resolve_config(document)
+                self.assertFalse(document["dataloader"]["get_batch"]["reset_position_ids"])
+                self.assertNotIn("use_fused_norm", document["model"]["config"])
+                self.setup.module_replacements = entries_to_module_replacements(recipe.plan_overrides)
+                model = self.build()
+                norms = [module for name, module in model.named_modules()
+                         if name.endswith(("q_a_layernorm", "kv_a_layernorm"))]
+                self.assertEqual(len(norms), 6)
+                self.assertTrue(all(isinstance(module, RMSNorm) for module in norms))
+                shared = model.model.layers[1].mlp.shared_experts
+                override = next(item for item in document["plan_overrides"]
+                                if item["match"] == "*.mlp.shared_experts" and "params" in item)
+                self.assertEqual(set(override["params"]), set(dict(shared.named_parameters())))
+                self.assertTrue(all(value == {"tp": "replicate"} for value in override["params"].values()))
+                self.assertEqual(isinstance(shared, SwiGLUMLP), filename == "hp_4k_1_card.yaml")
+                for name in document["fsdp_config"]["mix_precision"].get("custom_params", {}):
+                    self.assertIn(name, dict(model.named_parameters()))
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_optional_reference_uses_native_initialization(self) -> None:

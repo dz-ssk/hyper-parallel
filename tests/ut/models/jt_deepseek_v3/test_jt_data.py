@@ -48,7 +48,7 @@ class TestPreparedArrowDataset(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_saved_arrow_to_jt_inputs(self) -> None:
-        """Labels stay pre-shifted, optional masks are folded, and internal positions reset."""
+        """Labels stay pre-shifted, optional masks are folded, and packed positions stay continuous."""
         records = [
             {"input_ids": [3, 4, 5, 6, 7, 8], "labels": [4, 5, -100, 7, 8, -100],
              "loss_mask": [1, 0, 0, 1, 1, 0], "cu_seqlens": [0, 3, 6]},
@@ -63,15 +63,14 @@ class TestPreparedArrowDataset(unittest.TestCase):
                                                  collate_fn=TextPackingCollator()))
             mesh = SimpleNamespace(cp_size=1, pp_size=1, tp_size=1, dp_size=1, dp_rank=0, device_mesh=None)
             batch = TextParallelBatch(mesh, torch.device("cpu"), None, {}, False,
-                                      source_type="online", attention_mode="compressed", reset_position_ids=True,
+                                      source_type="online", attention_mode="compressed", reset_position_ids=False,
                                       runtime_input_adapter=JTSequenceRuntime())
             for record in records:
                 model, loss = batch(iterator)
                 targets = torch.tensor([record["labels"]])
                 targets[torch.tensor([record["loss_mask"]]) == 0] = -100
                 self.assertEqual(model["actual_seq_len"], tuple(record["cu_seqlens"][1:]))
-                positions = [position for start, end in zip(record["cu_seqlens"], record["cu_seqlens"][1:])
-                             for position in range(end - start)]
+                positions = list(range(len(record["input_ids"])))
                 torch.testing.assert_close(model["input_ids"], torch.tensor([record["input_ids"]]))
                 torch.testing.assert_close(model["position_ids"], torch.tensor([positions]))
                 torch.testing.assert_close(loss["shift_labels"], targets)
