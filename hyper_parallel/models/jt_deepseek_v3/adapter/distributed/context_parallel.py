@@ -245,8 +245,10 @@ class _JTTrainingContext:
         self.cp_group = self.cp_mesh.get_group()
         self.degree = self.cp_mesh.size()
         self.rank = self.cp_mesh.get_local_rank()
-        # TP replicas also contribute the same auxiliary objective when SP is disabled.
-        self.statistics_group = mesh.device_mesh[("cp", "tp")]._flatten().get_group()
+        # TP ranks route the same gathered tokens. Without loss parallelism FSDP already divides gradients by these
+        # TP loss replicas, so only a TP-parallel loss also averages the auxiliary objective over TP.
+        joint_mesh = mesh.device_mesh[("cp", "tp")]._flatten() if mesh.loss_parallel else self.cp_mesh
+        self.statistics_group = joint_mesh.get_group()
 
     def prepare(self, module: nn.Module, args: tuple, kwargs: dict) -> tuple[tuple, dict]:
         """Establish per-forward supervision counts and global RoPE positions."""

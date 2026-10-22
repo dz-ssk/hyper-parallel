@@ -135,6 +135,38 @@ class TestJTBuilder(unittest.TestCase):
         self.assertFalse(torch.equal(before, model.model.embed_tokens.weight))
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_tensor_parallel_auxiliary_gradient_matches_single_rank(self) -> None:
+        """Feature: Sequence aux-loss gradient under tensor parallelism.
+
+        Description: Bind TP2 statistics groups with and without loss parallelism, differentiate the aux loss on two
+            identical TP replicas, then apply the FSDP reduction: a sum over TP, divided by TP unless the loss is
+            TP-parallel.
+        Expectation: The reduced router-score gradient equals the single-rank gradient in both modes.
+        """
+        tp_size = 2
+        model = self.build()
+        moe = model.model.layers[1].mlp
+        scores = torch.rand(8, self.config["n_routed_experts"], dtype=torch.float64, requires_grad=True)
+        indices = scores.detach().topk(self.config["num_experts_per_tok"], dim=-1).indices
+        expected = torch.autograd.grad(moe.routing_statistics(indices, scores), scores)[0]
+        tp_mesh = SimpleNamespace(get_group=lambda: "tp")
+        for loss_parallel in (False, True):
+            mesh = SimpleNamespace(dp_cp_mesh=None, tp_size=tp_size, sequence_parallel=True,
+                                   loss_parallel=loss_parallel, device_mesh={"tp": tp_mesh})
+            jt_builder._bind_statistics_groups(model, mesh)  # pylint: disable=protected-access
+            # Every TP rank routes the same gathered tokens, so a SUM all-reduce adds identical replicas.
+            with patch("hyper_parallel.components.losses.moe_aux.dist.all_reduce",
+                       side_effect=lambda tensor, **_kwargs: tensor.mul_(tp_size)), patch(
+                           "hyper_parallel.components.losses.moe_aux.dist.get_world_size", return_value=tp_size):
+                replica = torch.autograd.grad(moe.routing_statistics(indices, scores), scores)[0]
+            # FSDP sums the replicas' router gradients over TP and divides by TP unless the loss is TP-parallel.
+            reduced = replica * tp_size / (1 if loss_parallel else tp_size)
+            torch.testing.assert_close(
+                reduced, expected, rtol=1e-12, atol=0,
+                msg=f"aux gradient mismatch with loss_parallel={loss_parallel}: reduced={reduced}, expected={expected}",
+            )
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_matching_reference_loads_exact_values(self) -> None:
         """Feature: Explicit reference loading.
 
