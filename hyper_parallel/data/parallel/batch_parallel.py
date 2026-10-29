@@ -234,6 +234,8 @@ class CPBatchSharder:
             "input_ids": input_ids,
             "labels": canonical_batch["labels"],
         }
+        if "valid_lengths" in canonical_batch:
+            cp_batch["valid_lengths"] = canonical_batch["valid_lengths"]
 
         cp_size = self.parallel_context.cp_world_size
         if cp_size <= 1:
@@ -244,7 +246,8 @@ class CPBatchSharder:
             raise ValueError(f"seq_len ({seq_len}) must be divisible by cp_size ({cp_size})")
 
         cp_rank = self.parallel_context.cp_rank
-        for field, value in cp_batch.items():
+        for field in ("input_ids", "labels"):
+            value = cp_batch[field]
             local_value = torch.chunk(value, cp_size, dim=1)[cp_rank]
             cp_batch[field] = local_value.contiguous()
 
@@ -356,26 +359,19 @@ class TPBatchBroadcaster:
             batch_size, seq_len = parallel_batch["input_ids"].shape
             num_boundaries = 0 if local_cu_seq_lens is None else local_cu_seq_lens.numel()
             batch_meta = torch.tensor(
-                [batch_size, seq_len, num_boundaries],
+                [batch_size, seq_len, num_boundaries, int("valid_lengths" in parallel_batch)],
                 dtype=torch.int64,
                 device=self.device,
             )
         else:
-            batch_meta = torch.empty((3,), dtype=torch.int64, device=self.device)
+            batch_meta = torch.empty((4,), dtype=torch.int64, device=self.device)
 
         tp_group = self.parallel_context.tp_group
         dist.broadcast(batch_meta, group=tp_group, group_src=0)
 
         # Non-source TP ranks allocate the same device shapes and dtypes.
         if tp_rank != 0:
-            batch_size, seq_len, num_boundaries = [int(value) for value in batch_meta.tolist()]
-            shape = (batch_size, seq_len)
-            parallel_batch = {
-                "input_ids": torch.empty(shape, dtype=torch.int64, device=self.device),
-                "labels": torch.empty(shape, dtype=torch.int64, device=self.device),
-            }
-            if num_boundaries > 0:
-                local_cu_seq_lens = torch.empty((num_boundaries,), dtype=torch.int32, device=self.device)
+            parallel_batch, local_cu_seq_lens = self._allocate_text_batch(batch_meta)
 
         # Broadcast only model fields that cannot be regenerated locally.
         for field in ("input_ids", "labels"):
@@ -387,10 +383,26 @@ class TPBatchBroadcaster:
         # Packed boundaries remain global across CP ranks and variable in size.
         if local_cu_seq_lens is not None:
             dist.broadcast(local_cu_seq_lens, group=tp_group, group_src=0)
+        if "valid_lengths" in parallel_batch:
+            dist.broadcast(parallel_batch["valid_lengths"], group=tp_group, group_src=0)
 
         parallel_batch["cu_seq_lens"] = local_cu_seq_lens
 
         return parallel_batch
+
+    def _allocate_text_batch(self, batch_meta: torch.Tensor) -> tuple[dict[str, torch.Tensor], Any]:
+        batch_size, seq_len, num_boundaries, has_valid_lengths = [int(value) for value in batch_meta.tolist()]
+        shape = (batch_size, seq_len)
+        batch = {
+            "input_ids": torch.empty(shape, dtype=torch.int64, device=self.device),
+            "labels": torch.empty(shape, dtype=torch.int64, device=self.device),
+        }
+        boundaries = None
+        if num_boundaries > 0:
+            boundaries = torch.empty((num_boundaries,), dtype=torch.int32, device=self.device)
+        if has_valid_lengths:
+            batch["valid_lengths"] = torch.empty((batch_size,), dtype=torch.int64, device=self.device)
+        return batch, boundaries
 
     def _broadcast_mapping(self, cp_local_batch: Mapping[str, Any] | None) -> dict[str, Any]:
         """Broadcast variable-shaped Omni tensors and scalar metadata."""

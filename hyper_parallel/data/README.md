@@ -454,3 +454,11 @@ enable_dataset_logging("debug", ranks=None)
 ```
 
 日志覆盖 source、split/blend、Dataset、Sampler、DataLoader 和 parallel batch 形状，不记录样本文本内容。
+
+### Prepared token/label records
+
+`PreTokenizedTransform` accepts already aligned pretraining/SFT targets and optional
+internal document boundaries without tokenization or shifting. The prepared-text
+collator preserves boundaries and true row lengths for packed or `[B,S]` batches.
+See [prepared data contracts and JT migration](../../docs/guide/pretokenized_data.md)
+for strict validation, field mapping, padding and runtime configuration.

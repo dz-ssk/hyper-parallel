@@ -194,7 +194,9 @@ class TextParallelBatch:
             tokenizer: Tokenizer providing EOD and padding token semantics.
             data_config: Dataset options used to build runtime LTR fields.
             pp_shared_data: Whether pipeline stages share the prepared batch.
-            source_type: ``online`` or ``indexed`` DataLoader batch contract.
+            source_type: ``online``, ``indexed`` or ``pretokenized`` batch contract.
+                Pretokenized batches carry authoritative labels, internal
+                boundaries and real row lengths, independent of EOD token IDs.
             attention_mode: ``dense`` or ``compressed`` attention representation.
             causal: Whether attention uses left-to-right causal semantics.
             sliding_window: Sliding-window size, or ``None`` for full attention.
@@ -223,7 +225,7 @@ class TextParallelBatch:
         self.runtime_input_adapter = runtime_input_adapter
         self._batch_flow_logged = False
 
-        if source_type == "online":
+        if source_type in ("online", "pretokenized"):
             self.boundary_resolver = OnlineBoundaryResolver()
             self.source_input_field = "input_ids"
         elif source_type == "indexed":
@@ -241,19 +243,31 @@ class TextParallelBatch:
         self.cp_sharder = CPBatchSharder(self.parallel_context)
         self.tp_broadcaster = TPBatchBroadcaster(self.parallel_context, device)
 
-        self.reset_position_ids = reset_position_ids or bool(self.data_config.get("reset_position_ids", False))
+        self.reset_position_ids = (
+            reset_position_ids or bool(self.data_config.get("reset_position_ids", False))
+            or source_type == "pretokenized"
+        )
         resolved_reset_attention_mask = (
             reset_attention_mask
             or bool(self.data_config.get("reset_attention_mask", False))
-            or source_type == "online"
+            or source_type in ("online", "pretokenized")
         )
         self.eod_mask_loss = eod_mask_loss or bool(self.data_config.get("eod_mask_loss", False))
+        self._validate_prepared_options(attention_mode, create_attention_mask)
         self.attention_runtime = AttentionRuntime(
             mode=attention_mode,
             create_mask=create_attention_mask,
             reset_mask=resolved_reset_attention_mask,
             sliding_window=sliding_window,
         )
+
+    def _validate_prepared_options(self, attention_mode: str, create_attention_mask: bool) -> None:
+        if self.source_type != "pretokenized":
+            return
+        if not self.labels_are_shifted or self.eod_mask_loss or not self.causal:
+            raise ValueError("Pretokenized batches require shifted labels, causal attention and eod_mask_loss=False")
+        if (attention_mode == "compressed" or not create_attention_mask) and self.runtime_input_adapter is None:
+            raise ValueError("Pretokenized batches without a dense mask require a boundary-aware runtime adapter")
 
     def __call__(
             self,
@@ -282,6 +296,12 @@ class TextParallelBatch:
             parallel_batch["cu_seq_lens"],
         )
         parallel_batch["position_ids"] = position_ids
+        if "valid_lengths" in parallel_batch:
+            local_seq_len = position_ids.shape[1]
+            global_positions = torch.arange(local_seq_len, device=position_ids.device)
+            global_positions = global_positions + self.parallel_context.cp_rank * local_seq_len
+            real_tokens = global_positions.unsqueeze(0) < parallel_batch["valid_lengths"].unsqueeze(1)
+            parallel_batch["position_ids"] = position_ids.masked_fill(~real_tokens, 0)
 
         loss_mask = self._build_loss_mask(parallel_batch)
         parallel_batch["loss_mask"] = loss_mask
@@ -371,8 +391,45 @@ class TextParallelBatch:
         canonical_batch = dict(source_batch)
         if self.source_input_field != "input_ids":
             canonical_batch["input_ids"] = canonical_batch.pop(self.source_input_field)
+        if self.source_type == "pretokenized":
+            self._validate_prepared_batch(canonical_batch)
 
         return canonical_batch
+
+    @staticmethod
+    def _validate_prepared_batch(batch: Mapping[str, Any]) -> None:
+        """Check authoritative layout metadata on the CPU before distribution."""
+        required = ("input_ids", "labels", "valid_lengths", "cu_seq_lens")
+        if any(key not in batch for key in required):
+            raise ValueError("Pretokenized batches require input_ids, labels, valid_lengths and cu_seq_lens")
+        tokens, labels, lengths, boundaries = (batch[key] for key in required)
+        if any(not isinstance(value, torch.Tensor) for value in (tokens, labels, lengths, boundaries)):
+            raise ValueError("Pretokenized batch fields must be tensors")
+        if tokens.ndim != 2 or not tokens.numel():
+            raise ValueError("Pretokenized tokens must be nonempty [B,S]")
+        expected = (
+            (tokens, torch.int64, tokens.shape), (labels, torch.int64, tokens.shape),
+            (lengths, torch.int64, (tokens.shape[0],)), (boundaries, torch.int32, (boundaries.numel(),)),
+        )
+        for value, dtype, shape in expected:
+            if value.dtype != dtype or value.shape != shape:
+                raise ValueError("Invalid pretokenized batch shapes or dtypes")
+        TextParallelBatch._validate_prepared_layout(tokens, labels, lengths, boundaries)
+
+    @staticmethod
+    def _validate_prepared_layout(
+        tokens: torch.Tensor, labels: torch.Tensor, lengths: torch.Tensor, boundaries: torch.Tensor,
+    ) -> None:
+        row_length = tokens.shape[1]
+        if (torch.any(lengths <= 0) or torch.any(lengths > row_length) or boundaries.numel() < 2
+                or boundaries[0] != 0 or boundaries[-1] != tokens.numel()
+                or torch.any(boundaries[1:] <= boundaries[:-1])):
+            raise ValueError("Invalid real lengths or cumulative document boundaries")
+        boundary_set = set(boundaries.tolist())
+        for row, length in enumerate(lengths.tolist()):
+            if (row * row_length not in boundary_set or row * row_length + length not in boundary_set
+                    or torch.any(labels[row, length:] != -100)):
+                raise ValueError("Each row and its padding tail require boundaries and ignored padding targets")
 
     def _resolve_sequence_boundaries(
             self,
@@ -435,6 +492,11 @@ class TextParallelBatch:
     def _build_loss_mask(self, parallel_batch: Mapping[str, Any]) -> Any:
         """Build the local loss mask from labels and input IDs."""
         loss_mask = (parallel_batch["labels"] >= 0).to(dtype=torch.int64)
+        if "valid_lengths" in parallel_batch:
+            local_seq_len = loss_mask.shape[1]
+            positions = torch.arange(local_seq_len, device=loss_mask.device)
+            positions = positions + self.parallel_context.cp_rank * local_seq_len
+            loss_mask = loss_mask * (positions.unsqueeze(0) < parallel_batch["valid_lengths"].unsqueeze(1))
 
         if self.eod_mask_loss:
             eod_token_id = getattr(self.tokenizer, "eod", None)

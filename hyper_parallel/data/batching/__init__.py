@@ -19,6 +19,7 @@ from hyper_parallel.data.batching.build_collate_fn import (
     build_indexed_collate_fn,
     build_omni_collate_fn,
     build_online_text_collate_fn,
+    build_pretokenized_collate_fn,
 )
 from hyper_parallel.data.batching.build_dataloader import (
     FixedBatchDataLoader,
@@ -54,5 +55,6 @@ __all__ = [
     "build_indexed_collate_fn",
     "build_omni_collate_fn",
     "build_online_text_collate_fn",
+    "build_pretokenized_collate_fn",
     "calculate_num_micro_batches",
 ]

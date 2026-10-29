@@ -42,62 +42,82 @@ def _get_sequence_parallel_size(mesh_context: Any | None) -> int:
 
 @dataclass
 class TextPackingCollator:
-    """Pack unpadded Online text samples and emit ``cu_seq_lens``.
+    """Collate unpadded text records, preserving internal document boundaries.
 
-    Only ``input_ids`` and pre-shifted ``labels`` are packed here. Unified
-    ``get_batch`` constructs loss, position, mask, and CP runtime fields.
+    Args:
+        sequence_parallel_size: Pad each row to this positive alignment.
+        pack: Concatenate records into one row, or pad one record per row.
+        pad_token_id: Token written only to newly created row tails.
     """
 
     sequence_parallel_size: int = 1
+    pack: bool = True
+    pad_token_id: int = 0
+
+    def __post_init__(self) -> None:
+        """Validate layout settings before constructing batches."""
+        if (isinstance(self.sequence_parallel_size, bool)
+                or not isinstance(self.sequence_parallel_size, int) or self.sequence_parallel_size <= 0):
+            raise ValueError("sequence_parallel_size must be a positive integer")
+        if not isinstance(self.pack, bool):
+            raise ValueError("pack must be a boolean")
+        if isinstance(self.pad_token_id, bool) or not isinstance(self.pad_token_id, int) or self.pad_token_id < 0:
+            raise ValueError("pad_token_id must be a nonnegative integer")
+
+    @staticmethod
+    def _boundaries(sample: Mapping[str, Any]) -> torch.Tensor:
+        try:
+            tokens, labels = sample["input_ids"], sample["labels"]
+        except KeyError as error:
+            raise ValueError("Text records require input_ids and labels") from error
+        if (not isinstance(tokens, torch.Tensor) or not isinstance(labels, torch.Tensor)
+                or tokens.ndim != 1 or not tokens.numel() or tokens.shape != labels.shape
+                or tokens.dtype != torch.int64 or labels.dtype != torch.int64):
+            raise ValueError("Text records require matching nonempty 1D int64 tokens and labels")
+        boundaries = torch.as_tensor(sample.get("cu_seq_lens", [0, tokens.numel()]), device=tokens.device)
+        if (boundaries.dtype not in (torch.int32, torch.int64) or boundaries.ndim != 1
+                or boundaries.numel() < 2 or boundaries[0] != 0 or boundaries[-1] != tokens.numel()
+                or torch.any(boundaries[1:] <= boundaries[:-1])):
+            raise ValueError("Sample boundaries must strictly increase from zero to token count")
+        return boundaries.to(torch.int64)
 
     def __call__(self, model_samples: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
-        """Pack samples into one ``[1, packed_length]`` forward-backward batch.
+        """Return [B,S] tokens/labels, global boundaries and real per-row lengths.
 
-        Args:
-            model_samples: Online samples selected for one forward-backward step.
-
-        Returns:
-            Packed ``input_ids`` and ``labels`` plus int32 ``cu_seq_lens``.
-
-        Raises:
-            ValueError: If no samples are provided.
+        Inputs must be unpadded. Prompt targets may be -100, so real lengths
+        cannot be inferred from labels or from the value of a token ID.
         """
         if not model_samples:
-            raise ValueError("model_samples must contain at least one Online sample")
-
-        packed_batch = {}
-        for field in ("input_ids", "labels"):
-            values = [model_sample[field] for model_sample in model_samples]
-            packed_batch[field] = torch.cat(values, dim=-1).unsqueeze(0)
-
-        input_ids = packed_batch.get("input_ids")
-        if input_ids is None or packed_batch.get("labels") is None:
-            raise ValueError("packed batch requires input_ids and labels")
-
-        packed_seq_len = input_ids.shape[-1]
-        pad_len = (-packed_seq_len) % self.sequence_parallel_size
-        if pad_len:
-            input_padding = input_ids.new_zeros((1, pad_len))
-            label_padding = packed_batch["labels"].new_full((1, pad_len), IGNORE_INDEX)
-            packed_batch["input_ids"] = torch.cat((input_ids, input_padding), dim=-1)
-            packed_batch["labels"] = torch.cat((packed_batch["labels"], label_padding), dim=-1)
-
-        seq_lens = model_samples[0]["input_ids"].new_tensor(
-            [model_sample["input_ids"].shape[-1] for model_sample in model_samples]
-        )
-        zero = seq_lens.new_zeros(1)
-        seq_ends = seq_lens.cumsum(dim=0)
-        if pad_len:
-            # Represent the alignment tail as one synthetic packed sequence so
-            # attention metadata covers every physical Q/KV token. Its labels
-            # remain IGNORE_INDEX and therefore do not contribute to the loss.
-            padded_end = seq_ends[-1:] + pad_len
-            seq_ends = torch.cat((seq_ends, padded_end))
-        cu_seq_lens = torch.cat((zero, seq_ends))
-        cu_seq_lens = cu_seq_lens.to(torch.int32)
-        packed_batch["cu_seq_lens"] = cu_seq_lens
-
-        return packed_batch
+            raise ValueError("model_samples must contain at least one text sample")
+        sample_boundaries = [self._boundaries(sample) for sample in model_samples]
+        sample_lengths = [sample["input_ids"].numel() for sample in model_samples]
+        valid_lengths = [sum(sample_lengths)] if self.pack else sample_lengths
+        row_length = max(valid_lengths)
+        row_length += (-row_length) % self.sequence_parallel_size
+        if row_length * len(valid_lengths) > torch.iinfo(torch.int32).max:
+            raise ValueError("Flattened batch boundaries must fit int32")
+        device = model_samples[0]["input_ids"].device
+        shape = (len(valid_lengths), row_length)
+        batch = {
+            "input_ids": torch.full(shape, self.pad_token_id, dtype=torch.int64, device=device),
+            "labels": torch.full(shape, IGNORE_INDEX, dtype=torch.int64, device=device),
+            "valid_lengths": torch.tensor(valid_lengths, dtype=torch.int64, device=device),
+        }
+        ends = []
+        row_offset = 0
+        for index, (sample, boundaries, length) in enumerate(zip(model_samples, sample_boundaries, sample_lengths)):
+            row = 0 if self.pack else index
+            start = row_offset if self.pack else 0
+            for field in ("input_ids", "labels"):
+                batch[field][row, start:start + length] = sample[field]
+            ends.append(boundaries[1:] + row * row_length + start)
+            row_offset += length
+            if not self.pack and length < row_length:
+                ends.append(boundaries.new_tensor([(row + 1) * row_length]))
+        if self.pack and valid_lengths[0] < row_length:
+            ends.append(sample_boundaries[0].new_tensor([row_length]))
+        batch["cu_seq_lens"] = torch.cat((sample_boundaries[0].new_zeros(1), *ends)).to(torch.int32)
+        return batch
 
 
 class OmniCollator:
@@ -168,3 +188,19 @@ def build_online_text_collate_fn(mesh_context: Any | None = None) -> TextPacking
     collate_fn = TextPackingCollator(sequence_parallel_size=sequence_parallel_size)
 
     return collate_fn
+
+
+def build_pretokenized_collate_fn(
+    mesh_context: Any | None = None, *, pack: bool = True, pad_token_id: int = 0,
+) -> TextPackingCollator:
+    """Build prepared text collation for packed or ordinary [B,S] batches.
+
+    Args:
+        mesh_context: Runtime topology determining CP/TP-SP alignment.
+        pack: Concatenate records when true; otherwise keep one record per row.
+        pad_token_id: Explicit row-tail padding token, independent of EOS/EOD.
+
+    Returns:
+        Collator retaining every internal document boundary and real row length.
+    """
+    return TextPackingCollator(_get_sequence_parallel_size(mesh_context), pack, pad_token_id)
