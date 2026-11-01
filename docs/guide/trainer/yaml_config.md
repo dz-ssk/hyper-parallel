@@ -177,3 +177,50 @@ Value 先由 `yaml.safe_load()` 解析，再按照目标节点的类型转换：
 - `Target` 参数必须已在配置中，或存在于 callable 签名中；带 `**kwargs` 的 callable 可以接收新增参数。
 - `_target_` 不参与替换，CLI override 不改变 callable。
 - 当前值为 `None` 的可选组件没有可继续遍历的配置节点，组件结构需要由 YAML 提供。
+
+## Loss normalization across micro-batches
+
+```yaml
+training:
+  loss_normalization: microbatch  # default; or token
+```
+
+Let `S[r,i]` be the sum of valid-target losses in micro-batch `i` of DP
+replica `r`, and `N[r,i]` its valid-target count after label alignment and
+masking. CP shards jointly form that micro-batch; TP replicas do not add
+samples. With `D` DP replicas and `M` micro-batches:
+
+- `microbatch`: `(1 / (D * M)) * sum(S[r,i] / N[r,i])`.
+  Empty micro-batches contribute zero and still occupy a micro-batch slot.
+- `token`: `sum(S[r,i]) / sum(N[r,i])` over the entire optimizer step.
+  Each forward/backward consumes only the current micro-batch. Counts are
+  accumulated as scalars; after gradient synchronization, gradients are
+  normalized before gradient inspection, clipping and optimizer updates.
+
+These objectives agree when all effective counts agree. In particular, fixed
+input length alone does not imply equal counts when targets are masked.
+`microbatch` retains the historical single-rank objective. Unlike the previous
+Trainer's token-weighting across DP on each micro-step, it gives DP replicas
+equal weight even when their target counts differ. Logs use the selected
+objective; model-provided diagnostic metrics retain their existing semantics.
+
+Loss functions must return local **mean** losses and report counts for the
+same CP-local targets, with finite backward behavior for empty local shards.
+TextParallelBatch replicates those targets across TP,
+including SP; counts are not summed again over TP. The Trainer compensates for
+its FSDP DP×CP gradient averaging. This contract does not support model losses
+that have already normalized across DP or CP.
+
+Token mode currently requires eager execution, ordinary Trainer-owned parameter
+gradients, and one shared token-count family for all differentiable loss terms.
+It rejects independent loss families (for example, separately normalized text
+and image objectives), externally managed gradients and the joint-graph compiler.
+The streaming Trainer entrypoints do not support PP normalization.
+
+An MTP term included in `foundation_loss` inherits the same outer micro-batch
+weight as LM; it is not independently normalized by an MTP target count.
+Auxiliary losses attached through `aux_loss_auto_scale` inherit that same
+weight through the existing loss-scale hook. Models needing different weighting
+must expose an appropriate objective rather than silently sharing the LM divisor.
+Token mode accumulates numerator gradients, so intermediate gradient magnitudes
+can be larger than in micro-batch mode, especially with low-precision gradients.

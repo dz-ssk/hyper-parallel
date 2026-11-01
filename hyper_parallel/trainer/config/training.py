@@ -31,6 +31,7 @@ class TrainingConfig:
 
     global_batch_size: int = 8
     micro_batch_size: int = 1
+    loss_normalization: Literal["microbatch", "token"] = "microbatch"
 
     backend: Literal["nccl", "hccl", "gloo"] = "nccl"
     max_grad_norm: float = 1.0
@@ -45,6 +46,11 @@ class TrainingConfig:
     eval_epochs: int = 0
     logging_steps: int = 1
     low_precision: LowPrecisionConfig = field(default_factory=LowPrecisionConfig)
+
+    def __post_init__(self) -> None:
+        """Validate the optimizer-step loss objective."""
+        if self.loss_normalization not in ("microbatch", "token"):
+            raise ValueError("training.loss_normalization must be microbatch or token")
 
 
 @dataclass

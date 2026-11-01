@@ -71,6 +71,7 @@ from hyper_parallel.trainer.runtime.distributed import (
 )
 from hyper_parallel.trainer.runtime.logging import setup_logging
 from hyper_parallel.trainer.runtime.loss_aggregation import count_loss_token
+from hyper_parallel.trainer.runtime.loss_normalization import StepLossNormalization
 from hyper_parallel.trainer.runtime.metrics import mean_global_loss
 from hyper_parallel.components.functional.aux_loss import aux_loss_scale_context, bind_aux_loss_scale
 from hyper_parallel.components.modules.moe_utils import MoEMonitorCallback
@@ -243,6 +244,7 @@ class BaseTrainer(Stateful, ABC):
     # Training context
     model_fwd_context: Any
     model_bwd_context: Any
+    loss_normalizer: Optional[StepLossNormalization] = None
 
     # # Runtime metrics, controlled by trace_callback
     # environ_meter: helper.EnvironMeter  # see in trace_callback.EnvironMeterCallback
@@ -750,12 +752,12 @@ class BaseTrainer(Stateful, ABC):
         foundation_loss = local_loss.get("foundation_loss") if isinstance(local_loss, dict) else local_loss
         if foundation_loss is not None:
             bind_aux_loss_scale(foundation_loss)
-        loss_dict: Dict[str, torch.Tensor] = mean_global_loss(
-            local_loss,
-            current_token_counts,
-            step_token_counts,
-            device_mesh=self.mesh,
-        )
+        if self.loss_normalizer is None:
+            loss_dict = mean_global_loss(
+                local_loss, current_token_counts, step_token_counts, device_mesh=self.mesh,
+            )
+        else:
+            loss_dict = self.loss_normalizer.reduce(local_loss, current_token_counts)
         loss = torch.stack(list(loss_dict.values())).sum()
         # Model-declared extra metrics join the logged mapping only after
         # the backward loss is fixed: log-only, never part of the loss.
@@ -910,6 +912,22 @@ class BaseTrainer(Stateful, ABC):
             )
             self.fsdp_runtime_diagnostics.validate_before_optimizer_step()
 
+    def begin_loss_step(self, num_micro_steps: int) -> None:
+        """Start one streaming loss accumulation window."""
+        mode = self.config.training.loss_normalization
+        if mode == "token":
+            if self.graph_compiler is not None:
+                raise ValueError("token loss normalization requires eager Trainer execution")
+            if get_model_external_state(self.model) is not None:
+                raise ValueError("token loss normalization does not support externally managed gradients")
+        if self.mesh.pp_size > 1:
+            raise ValueError("streaming Trainer loss normalization does not support pipeline parallelism")
+        self.loss_normalizer = StepLossNormalization(mode, num_micro_steps, self.mesh)
+
+    def finish_loss_step(self, loss: float, metrics: dict[str, float]) -> tuple[float, dict[str, float]]:
+        """Finalize loss scaling before gradient inspection and clipping."""
+        return self.loss_normalizer.finish(self.model.parameters(), loss, metrics)
+
     def prepare_optimizer_step(self) -> Any:
         """Run pre-optimizer diagnostics and clipping in their required order."""
         self.model_integration.after_backward_before_clip()
@@ -1017,6 +1035,7 @@ class BaseTrainer(Stateful, ABC):
         # token num for fixed_ce_loss in postforward
         self.step_token_counts = count_loss_token(micro_batches)
         num_micro_steps = len(micro_batches)
+        self.begin_loss_step(num_micro_steps)
         # forward and backward pass with gradient_accumulationsteps
         for micro_step, micro_batch in enumerate(micro_batches):
             self.model_reshard(micro_step, num_micro_steps)
@@ -1032,6 +1051,7 @@ class BaseTrainer(Stateful, ABC):
             for k, v in loss_dict.items():
                 total_loss_dict[k] += v.item()
 
+        total_loss, total_loss_dict = self.finish_loss_step(total_loss, total_loss_dict)
         grad_norm = self.prepare_optimizer_step()
         self.step_optimizers_and_schedulers()
 

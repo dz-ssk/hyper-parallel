@@ -23,6 +23,8 @@ import weakref
 import torch
 
 from hyper_parallel.trainer.base import BaseTrainer
+from hyper_parallel.trainer.config.training import TrainingConfig
+from hyper_parallel.distributed.mesh import MeshContext
 from hyper_parallel.trainer.callbacks.environ_meter_callback import EnvironMeterCallback
 from hyper_parallel.trainer.state import TrainerState
 from hyper_parallel.trainer.vlm_trainer import VLMTrainer
@@ -52,7 +54,9 @@ class TestVLMTrainer(unittest.TestCase):
         trainer.base = base
         base.num_micro_batches = num_micro_steps
         base.state = TrainerState(global_step=0, epoch=0)
-        base.mesh = SimpleNamespace(dp_cp_mesh=None, cp_size=1)
+        base.mesh = MeshContext()
+        base.config = SimpleNamespace(training=TrainingConfig())
+        base.model = torch.nn.Linear(1, 1)
         base.optimizer = SimpleNamespace(param_groups=[{"lr": 0.001}])
         base.lr_scheduler = None
         base.model_integration = SimpleNamespace(begin_step=Mock())

@@ -257,6 +257,7 @@ class TextTrainer:
         """
         memory_profiler.step()
         num_micro_steps = self.base.num_micro_batches
+        self.base.begin_loss_step(num_micro_steps)
 
         self.on_step_begin()
         self.base.model_integration.begin_step(self.base.state.global_step + 1)
@@ -281,6 +282,7 @@ class TextTrainer:
             for loss_name, loss_value in loss_dict.items():
                 total_loss_dict[loss_name] += loss_value.item()
 
+        total_loss, total_loss_dict = self.base.finish_loss_step(total_loss, total_loss_dict)
         grad_norm = self.base.prepare_optimizer_step()
         self.base.step_optimizers_and_schedulers()
 
