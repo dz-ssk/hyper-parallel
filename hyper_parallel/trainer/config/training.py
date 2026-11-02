@@ -47,11 +47,6 @@ class TrainingConfig:
     logging_steps: int = 1
     low_precision: LowPrecisionConfig = field(default_factory=LowPrecisionConfig)
 
-    def __post_init__(self) -> None:
-        """Validate the optimizer-step loss objective."""
-        if self.loss_normalization not in ("microbatch", "token"):
-            raise ValueError("training.loss_normalization must be microbatch or token")
-
 
 @dataclass
 class DebugConfig:

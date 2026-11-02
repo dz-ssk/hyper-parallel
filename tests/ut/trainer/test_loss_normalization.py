@@ -29,6 +29,7 @@ from torch import nn
 from hyper_parallel.components.functional.aux_loss import aux_loss_auto_scale
 from hyper_parallel.distributed.mesh import MeshContext
 from hyper_parallel.trainer.base import BaseTrainer
+from hyper_parallel.trainer.config.resolver import ConfigResolutionError, normalize_value
 from hyper_parallel.trainer.config.training import TrainingConfig
 from hyper_parallel.trainer.runtime.loss_aggregation import count_loss_token
 from hyper_parallel.trainer.runtime.loss_normalization import StepLossNormalization
@@ -174,10 +175,16 @@ class TestStepLossNormalization(unittest.TestCase):
             normalizer.reduce({"image_loss": torch.tensor(1.)}, {"image_tokens": torch.tensor(3)})
 
     def test_mode_validation(self):
-        """Reject misspelled YAML modes and empty accumulation windows."""
+        """Validate parsed YAML and direct runtime construction at their existing boundaries."""
         self.assertEqual(TrainingConfig().loss_normalization, "microbatch")
+        for mode in ("microbatch", "token"):
+            config = normalize_value({"loss_normalization": mode}, TrainingConfig, path="training")
+            self.assertEqual(config.loss_normalization, mode)
+        with self.assertRaisesRegex(ConfigResolutionError, "training.loss_normalization"):
+            normalize_value({"loss_normalization": "tokens"}, TrainingConfig, path="training")
+        config = TrainingConfig(loss_normalization="tokens")
         with self.assertRaisesRegex(ValueError, "loss_normalization"):
-            TrainingConfig(loss_normalization="tokens")
+            StepLossNormalization(config.loss_normalization, 1, MeshContext())
         with self.assertRaisesRegex(ValueError, "positive"):
             StepLossNormalization("token", 0, MeshContext())
 
