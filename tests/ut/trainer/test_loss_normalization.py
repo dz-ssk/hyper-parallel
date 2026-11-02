@@ -176,8 +176,9 @@ class TestStepLossNormalization(unittest.TestCase):
 
     def test_mode_validation(self):
         """Validate parsed YAML and direct runtime construction at their existing boundaries."""
-        self.assertEqual(TrainingConfig().loss_normalization, "microbatch")
-        for mode in ("microbatch", "token"):
+        self.assertEqual(TrainingConfig().loss_normalization, "legacy")
+        self.assertEqual(normalize_value({}, TrainingConfig, path="training").loss_normalization, "legacy")
+        for mode in ("legacy", "microbatch", "token"):
             config = normalize_value({"loss_normalization": mode}, TrainingConfig, path="training")
             self.assertEqual(config.loss_normalization, mode)
         with self.assertRaisesRegex(ConfigResolutionError, "training.loss_normalization"):
@@ -247,7 +248,7 @@ class TestTrainerLossNormalization(unittest.TestCase):
     def test_streaming_backward_and_auxiliary_scaling(self):
         """Both entrypoints release inputs and normalize all gradients before optimizer preparation."""
         for trainer_type in (TextTrainer, VLMTrainer):
-            for mode in ("microbatch", "token"):
+            for mode in ("legacy", "microbatch", "token"):
                 for auxiliary in (False, True):
                     with self.subTest(trainer=trainer_type, mode=mode, auxiliary=auxiliary):
                         trainer = self.make_trainer(trainer_type, mode, auxiliary)
@@ -264,7 +265,7 @@ class TestTrainerLossNormalization(unittest.TestCase):
                             mask = torch.arange(3).reshape(1, 3) < count
                             return {"input_ids": data}, {"shift_labels": labels, "loss_mask": mask}
                         trainer.base.get_batch = get_batch
-                        expected = 1.5 if mode == "microbatch" else 1.75
+                        expected = 1.75 if mode == "token" else 1.5
                         def before_clip() -> float:
                             """Inspect final gradients at the optimizer preparation boundary."""
                             self.assertAlmostEqual(trainer.base.model.weight.grad.item(), 4 * expected)
@@ -276,13 +277,17 @@ class TestTrainerLossNormalization(unittest.TestCase):
                         trainer.base.prepare_optimizer_step.side_effect = before_clip
                         module = "text_trainer" if trainer_type is TextTrainer else "vlm_trainer"
                         with patch(f"hyper_parallel.trainer.{module}.synchronize"), \
-                             patch(f"hyper_parallel.trainer.{module}.memory_profiler.step"):
+                             patch(f"hyper_parallel.trainer.{module}.memory_profiler.step"), \
+                             patch("hyper_parallel.trainer.runtime.metrics.all_reduce",
+                                   side_effect=lambda value, **_: value):
                             result = trainer.train_step(iter(((1, 1.0), (3, 2.0))))
                         self.assertAlmostEqual(result["loss"], 4 * expected)
                         self.assertEqual(trainer.base.state.global_step, 1)
                         # A new step must reset its denominator, not accumulate previous steps.
                         with patch(f"hyper_parallel.trainer.{module}.synchronize"), \
-                             patch(f"hyper_parallel.trainer.{module}.memory_profiler.step"):
+                             patch(f"hyper_parallel.trainer.{module}.memory_profiler.step"), \
+                             patch("hyper_parallel.trainer.runtime.metrics.all_reduce",
+                                   side_effect=lambda value, **_: value):
                             trainer.base.model.zero_grad()
                             trainer.train_step(iter(((1, 1.0), (3, 2.0))))
                         self.assertEqual(trainer.base.state.global_step, 2)
@@ -297,3 +302,71 @@ class TestTrainerLossNormalization(unittest.TestCase):
         trainer.base.model._hp_external_state = object()
         with self.assertRaisesRegex(ValueError, "externally managed"):
             trainer.base.begin_loss_step(2)
+        del trainer.base.model._hp_external_state
+        trainer.base.mesh.pp_size = 2
+        with self.assertRaisesRegex(ValueError, "pipeline parallelism"):
+            trainer.base.begin_loss_step(2)
+
+    def test_legacy_preserves_existing_execution_paths(self):
+        """Default mode bypasses new restrictions and clears a previous step's normalizer."""
+        trainer = self.make_trainer(TextTrainer, "microbatch", False)
+        base = trainer.base
+        base.begin_loss_step(2)
+        self.assertIsNotNone(base.loss_normalizer)
+        base.config.training = TrainingConfig()
+        base.graph_compiler = object()
+        base.model._hp_external_state = object()
+        base.mesh.pp_size = 2
+        base.model.weight.grad = torch.tensor(7.0)
+        base.begin_loss_step(2)
+        self.assertIsNone(base.loss_normalizer)
+        metrics = {"foundation_loss": 3.0}
+        loss, actual_metrics = base.finish_loss_step(3.0, metrics)
+        self.assertEqual(loss, 3.0)
+        self.assertIs(actual_metrics, metrics)
+        self.assertEqual(base.model.weight.grad.item(), 7.0)
+
+    def test_microbatch_does_not_reject_pipeline_parallelism(self):
+        """Only token mode introduces a PP restriction; microbatch has no final gradient scaling."""
+        trainer = self.make_trainer(TextTrainer, "microbatch", False)
+        trainer.base.mesh.pp_size = 2
+        trainer.base.graph_compiler = object()
+        trainer.base.begin_loss_step(2)
+        self.assertEqual(trainer.base.loss_normalizer.mode, "microbatch")
+        trainer.base.model.weight.grad = torch.tensor(7.0)
+        trainer.base.finish_loss_step(3.0, {})
+        self.assertEqual(trainer.base.model.weight.grad.item(), 7.0)
+
+    def test_legacy_uses_original_dp_weighting(self):
+        """Unequal DP counts retain the old per-micro-step token weighting and backward scale."""
+        counts = ((1, 2), (4, 1))
+        values = ((1.0, 4.0), (3.0, 8.0))
+        gradients = []
+        expected = sum(
+            sum(counts[rank][step] * values[rank][step] for rank in range(2))
+            / sum(counts[rank][step] for rank in range(2)) for step in range(2)
+        ) / 2
+        for rank in range(2):
+            base = self.make_trainer(TextTrainer, "legacy", False).base
+            base.mesh.dp_size = 2
+            base.begin_loss_step(2)
+            total = 0.0
+            for step in range(2):
+                count = torch.tensor(counts[rank][step])
+                global_count = sum(counts[replica][step] for replica in range(2))
+                global_sum = 4 * sum(counts[replica][step] * values[replica][step] for replica in range(2))
+                with patch("hyper_parallel.trainer.runtime.metrics.all_reduce",
+                           side_effect=(global_count * 2, global_sum)) as reduce_mock:
+                    loss, _ = base.postforward(
+                        base.model.weight.square() * values[rank][step], None,
+                        current_token_counts={"foundation_tokens": count},
+                        step_token_counts={"foundation_tokens": count * 2},
+                    )
+                    self.assertEqual(reduce_mock.call_count, 2)
+                    self.assertEqual(reduce_mock.call_args_list[0].args[0], counts[rank][step] * 2)
+                loss.backward()
+                total += loss.item()
+            total, _ = base.finish_loss_step(total, {})
+            self.assertAlmostEqual(total, 4 * expected, places=5)
+            gradients.append(base.model.weight.grad)
+        torch.testing.assert_close(torch.stack(gradients).mean(), torch.tensor(4 * expected))

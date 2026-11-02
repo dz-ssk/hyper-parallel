@@ -915,17 +915,22 @@ class BaseTrainer(Stateful, ABC):
     def begin_loss_step(self, num_micro_steps: int) -> None:
         """Start one streaming loss accumulation window."""
         mode = self.config.training.loss_normalization
+        if mode == "legacy":
+            self.loss_normalizer = None
+            return
         if mode == "token":
             if self.graph_compiler is not None:
                 raise ValueError("token loss normalization requires eager Trainer execution")
             if get_model_external_state(self.model) is not None:
                 raise ValueError("token loss normalization does not support externally managed gradients")
-        if self.mesh.pp_size > 1:
-            raise ValueError("streaming Trainer loss normalization does not support pipeline parallelism")
+            if self.mesh.pp_size > 1:
+                raise ValueError("token loss normalization does not support pipeline parallelism")
         self.loss_normalizer = StepLossNormalization(mode, num_micro_steps, self.mesh)
 
     def finish_loss_step(self, loss: float, metrics: dict[str, float]) -> tuple[float, dict[str, float]]:
         """Finalize loss scaling before gradient inspection and clipping."""
+        if self.loss_normalizer is None:
+            return loss, metrics
         return self.loss_normalizer.finish(self.model.parameters(), loss, metrics)
 
     def prepare_optimizer_step(self) -> Any:

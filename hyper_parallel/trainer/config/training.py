@@ -31,7 +31,7 @@ class TrainingConfig:
 
     global_batch_size: int = 8
     micro_batch_size: int = 1
-    loss_normalization: Literal["microbatch", "token"] = "microbatch"
+    loss_normalization: Literal["legacy", "microbatch", "token"] = "legacy"
 
     backend: Literal["nccl", "hccl", "gloo"] = "nccl"
     max_grad_norm: float = 1.0
