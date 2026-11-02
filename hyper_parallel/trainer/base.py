@@ -753,8 +753,11 @@ class BaseTrainer(Stateful, ABC):
         if foundation_loss is not None:
             bind_aux_loss_scale(foundation_loss)
         if self.loss_normalizer is None:
-            loss_dict = mean_global_loss(
-                local_loss, current_token_counts, step_token_counts, device_mesh=self.mesh,
+            loss_dict: Dict[str, torch.Tensor] = mean_global_loss(
+                local_loss,
+                current_token_counts,
+                step_token_counts,
+                device_mesh=self.mesh,
             )
         else:
             loss_dict = self.loss_normalizer.reduce(local_loss, current_token_counts)

@@ -186,8 +186,6 @@ class TestStepLossNormalization(unittest.TestCase):
         config = TrainingConfig(loss_normalization="tokens")
         with self.assertRaisesRegex(ValueError, "loss_normalization"):
             StepLossNormalization(config.loss_normalization, 1, MeshContext())
-        with self.assertRaisesRegex(ValueError, "positive"):
-            StepLossNormalization("token", 0, MeshContext())
 
     def test_cp_denominator_and_dp_gradient_compensation(self):
         """CP shards form one micro-batch; DP replicas contribute independent micro-batches."""

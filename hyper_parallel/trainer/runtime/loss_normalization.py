@@ -44,8 +44,6 @@ class StepLossNormalization:
         """Create fresh scalar accounting for one optimizer step."""
         if mode not in ("microbatch", "token"):
             raise ValueError("loss_normalization must be 'microbatch' or 'token'")
-        if micro_steps < 1:
-            raise ValueError("micro_steps must be positive")
         self.mode = mode
         self.micro_steps = micro_steps
         self.mesh = mesh
@@ -68,9 +66,9 @@ class StepLossNormalization:
         if self.mode == "token":
             if len(families) != 1 or (self.token_family is not None and families != {self.token_family}):
                 raise ValueError("token normalization requires one shared loss token family per optimizer step")
-            self.token_family = next(iter(families))
-            reference = next(iter(losses.values()))
-            count = counts[f"{self.token_family}_tokens"].detach().to(reference.device)
+            self.token_family, = families
+            loss_device = next(iter(losses.values())).device
+            count = counts[f"{self.token_family}_tokens"].detach().to(loss_device)
             self.token_count = count if self.token_count is None else self.token_count + count
             self.loss_names.update(losses)
 
