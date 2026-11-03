@@ -59,7 +59,9 @@ def count_loss_token(
             for key in obj.keys():
                 if key.endswith("_labels") and key != "shift_labels":
                     token_name = key.split("_labels")[0]
-                    token_len[f"{token_name}_tokens"] = torch.sum(obj[key] != IGNORE_INDEX)  # image generation tokens
+                    count_key = f"{token_name}_tokens"
+                    count = torch.sum(obj[key] != IGNORE_INDEX)
+                    token_len[count_key] = token_len.get(count_key, 0) + count
 
             if "image_output_mask" in obj:
                 image_decoder_tokens = torch.sum(obj["image_output_mask"])
