@@ -43,6 +43,11 @@ class _MTPRMSNorm(nn.Module):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.eps = eps
+        self._hp_reset_after_materialization = True
+
+    def reset_parameters(self) -> None:
+        """Restore the unit scale after meta-device materialization."""
+        nn.init.ones_(self.weight)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Normalize in FP32 and preserve the reference multiplication order."""
@@ -90,7 +95,8 @@ class MTPLayer(nn.Module):
         if hidden_states.shape != inputs_embeds.shape:
             raise ValueError("MTP hidden_states and inputs_embeds must have identical shapes")
         projection_input = torch.cat((self.enorm(inputs_embeds), self.hnorm(hidden_states)), dim=-1)
-        return self.post_norm(self.mtp_block(self.eh_proj(projection_input), **decoder_kwargs))
+        hidden = self.mtp_block(self.eh_proj(projection_input), **decoder_kwargs)
+        return self.post_norm(hidden[0] if isinstance(hidden, tuple) else hidden)
 
 
 @dataclass

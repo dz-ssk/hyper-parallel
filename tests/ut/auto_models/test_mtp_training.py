@@ -26,18 +26,21 @@ from unittest.mock import patch
 import torch
 from torch.utils.checkpoint import DefaultDeviceType
 import yaml
-from transformers import DeepseekV3Config
-from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3ForCausalLM
+from transformers import LlamaConfig, Qwen2Config
+from transformers import LlamaForCausalLM
 
 from hyper_parallel.components.losses import ModelOutputLoss, compute_mtp_loss
 from hyper_parallel.distributed.activation_checkpoint import (
     _apply_activation_checkpointing, _find_transformer_block_modules,
 )
 from hyper_parallel.distributed.mtp import shift_mtp_tokens
-from hyper_parallel.models.deepseek_v3.adapter.mtp_pipeline import partition_mtp_model, MTPPipelineModule
-from hyper_parallel.models.deepseek_v3.adapter.mtp_data import MTPTextParallelBatch, prepare_mtp_inputs
+from hyper_parallel.distributed.mtp_pipeline import partition_mtp_model, MTPPipelineModule
+from hyper_parallel.data.batching.mtp import MTPTextParallelBatch, prepare_mtp_inputs
 from hyper_parallel.distributed.mesh import MeshContext
-from hyper_parallel.models.deepseek_v3.adapter.mtp import build_model, DeepseekV3MTPForCausalLM
+from hyper_parallel.models._transformers import HyperAutoModelForCausalLM
+from hyper_parallel.components.modules.mtp_training import attach_mtp, _decoder_inputs, _targets
+from hyper_parallel.models._transformers.model_builder import _initialize_model_weights
+from hyper_parallel.models.materialization import MaterializationContext, rebuild_materialized_state
 from hyper_parallel.trainer.base import BaseTrainer
 from hyper_parallel.trainer.callbacks.environ_meter_callback import EnvironMeterCallback
 from hyper_parallel.trainer.callbacks.tqdm_callback import TqdmCallback
@@ -62,7 +65,7 @@ class TestMTPTraining(unittest.TestCase):
                     return_value=torch.device("cpu"))
         cpu.start()
         self.addCleanup(cpu.stop)
-        recipe = Path(__file__).resolve().parents[3] / "hyper_parallel/models/deepseek_v3/recipes/mtp.yaml"
+        recipe = Path(__file__).resolve().parents[3] / "examples/mtp.yaml"
         self.raw = yaml.safe_load(recipe.read_text())
         self.ids = torch.tensor([[1, 3, 5, 7, 9, 11, 13, 15], [2, 4, 6, 8, 10, 12, 14, 16]])
 
@@ -72,6 +75,19 @@ class TestMTPTraining(unittest.TestCase):
         raw["model"]["mtp_num_layers"] = depth
         raw["model"]["mtp_loss_factor"] = factor
         return resolve_config(raw).model.build(model_init_dtype="float32")
+
+    def test_trainer_build_registers_mtp_before_optimizer(self) -> None:
+        """Execute Trainer's real build path, not a model-specific constructor."""
+        trainer = SimpleNamespace(config=resolve_config(copy.deepcopy(self.raw)),
+                                  distributed_setup=None, global_rank=0, mesh=MeshContext())
+        BaseTrainer._build_model(trainer)
+        self.assertEqual(len(trainer.model.mtp.layers), 1)
+        optimizer = torch.optim.AdamW(trainer.model.parameters(), foreach=False, fused=False)
+        registered = {id(param) for group in optimizer.param_groups for param in group["params"]}
+        self.assertTrue(all(id(param) in registered for param in trainer.model.mtp.parameters()))
+        losses = trainer.model(self.ids, labels=self.ids, use_cache=False).loss
+        sum(losses.values()).backward()
+        self.assertGreater(trainer.model.mtp.layers[0].eh_proj.weight.grad.norm().item(), 0)
 
     def test_yaml_depth_optimizer_and_checkpoint(self) -> None:
         """One/two configured depths register, receive gradients, update and reload."""
@@ -113,9 +129,44 @@ class TestMTPTraining(unittest.TestCase):
         """Omitted/zero depth leaves the original architecture and loss unchanged."""
         for depth in (None, 0):
             model = self.build(depth)
-            self.assertIs(type(model), DeepseekV3ForCausalLM)
+            self.assertIs(type(model), LlamaForCausalLM)
             self.assertFalse(any(name.startswith("mtp.") for name, _ in model.named_parameters()))
             self.assertTrue(torch.isfinite(model(self.ids, labels=self.ids).loss))
+
+    def test_shared_builder_supports_another_model_and_preserves_trunk(self) -> None:
+        """The same public entry works for Llama and Qwen2 without family-specific MTP classes."""
+        for config_type in (LlamaConfig, Qwen2Config):
+            config = config_type(vocab_size=32, hidden_size=16, intermediate_size=32,
+                                 num_hidden_layers=2, num_attention_heads=2, num_key_value_heads=2,
+                                 max_position_embeddings=32, use_cache=False)
+            torch.manual_seed(51)
+            native = HyperAutoModelForCausalLM.from_config(config, attn_implementation="eager")
+            torch.manual_seed(51)
+            candidate = HyperAutoModelForCausalLM.from_config(
+                config, mtp_num_layers=2, attn_implementation="eager")
+            self.assertIs(type(native), type(candidate))
+            for name, value in native.state_dict().items():
+                torch.testing.assert_close(value, candidate.state_dict()[name], rtol=0, atol=0)
+            expected = native(self.ids, labels=self.ids)
+            actual = candidate(self.ids, labels=self.ids)
+            torch.testing.assert_close(expected.logits, actual.logits)
+            torch.testing.assert_close(expected.loss, actual.loss["foundation_loss/lm_loss"])
+            sum(actual.loss.values()).backward()
+            for layer in candidate.mtp.layers:
+                self.assertGreater(layer.eh_proj.weight.grad.norm().item(), 0)
+
+    def test_meta_materialization_restores_norms_and_rotary_state(self) -> None:
+        """Exercise the actual empty-storage initialization used before distributed training."""
+        config = LlamaConfig(**{k: v for k, v in self.raw["model"]["config"].items() if k != "_target_"})
+        with torch.device("meta"):
+            model = attach_mtp(LlamaForCausalLM(config), 2)
+        model.to_empty(device="cpu")
+        _initialize_model_weights(model)
+        rebuild_materialized_state(model, MaterializationContext(reason="random_init", device=torch.device("cpu")))
+        for layer in model.mtp.layers:
+            for norm in (layer.enorm, layer.hnorm, layer.post_norm):
+                torch.testing.assert_close(norm.weight, torch.ones_like(norm.weight))
+        self.assertTrue(torch.isfinite(sum(model(self.ids, labels=self.ids).loss.values())))
 
     def test_factor_scales_only_mtp_gradients(self) -> None:
         """The YAML coefficient affects MTP and its gradient exactly once."""
@@ -176,7 +227,7 @@ class TestMTPTraining(unittest.TestCase):
         """Left/right padded tokens contribute neither LM nor shifted MTP losses."""
         model = self.build(2)
         padding = torch.tensor([[0, 0, 1, 1, 1, 1, 0, 0], [1, 1, 1, 1, 1, 0, 0, 0]])
-        targets = model._targets(self.ids, self.ids, None, None, padding)
+        targets = _targets(model, self.ids, self.ids, None, None, padding)
         expected = torch.tensor([[-100, -100, 7, 9, 11, -100, -100, -100],
                                  [4, 6, 8, 10, -100, -100, -100, -100]])
         torch.testing.assert_close(targets, expected)
@@ -186,13 +237,13 @@ class TestMTPTraining(unittest.TestCase):
         losses = model(self.ids, labels=self.ids, attention_mask=padding).loss
         self.assertTrue(all(torch.isfinite(loss) for loss in losses.values()))
 
-    def test_validation_before_allocating_model(self) -> None:
+    def test_validation_on_model_construction(self) -> None:
         """Reject invalid configuration and unsupported layouts instead of silently ignoring MTP."""
-        config = self.raw["model"]["config"]
+        config = LlamaConfig(**{k: v for k, v in self.raw["model"]["config"].items() if k != "_target_"})
         for options in ({"mtp_num_layers": -1}, {"mtp_num_layers": True}, {"mtp_loss_factor": float("nan")},
                         {"mtp_loss_factor": -0.1}, {"mtp_loss_normalization": "unknown"}):
             with self.subTest(options=options), self.assertRaises(ValueError):
-                build_model(config, **options)
+                HyperAutoModelForCausalLM.from_config(config, **({"mtp_num_layers": 1} | options))
 
     def test_real_text_batches_and_accumulated_loss_match_full_batch(self) -> None:
         """The data runtime and Trainer normalize each MTP depth over the whole GA window."""
@@ -230,26 +281,29 @@ class TestMTPTraining(unittest.TestCase):
     def test_reload_constructor_and_inference(self) -> None:
         """Persist MTP configuration and keep inference on the ordinary LM head."""
         model = self.build(2)
-        restored_config = DeepseekV3Config.from_dict(model.config.to_dict())
-        restored = DeepseekV3MTPForCausalLM.from_config(restored_config)
+        restored_config = LlamaConfig.from_dict(model.config.to_dict())
+        restored = HyperAutoModelForCausalLM.from_config(restored_config)
         restored.load_state_dict(model.state_dict())
         self.assertEqual(len(restored.mtp.layers), 2)
         with torch.no_grad():
             output = restored(self.ids, use_cache=False)
         self.assertIsNone(output.loss)
         self.assertEqual(output.logits.shape, (2, 8, 32))
+        disabled = HyperAutoModelForCausalLM.from_config(restored_config, mtp_num_layers=0)
+        self.assertFalse(hasattr(disabled, "mtp"))
+        self.assertEqual(disabled.config.mtp_num_layers, 0)
 
     def test_fixed_length_matches_truncated_objective(self) -> None:
         """Padding keeps valid logits/gradients equal to the original full-row loop."""
         model = self.build(2)
         hidden = model.model.embed_tokens(self.ids)
         positions = torch.arange(self.ids.shape[1])[None]
-        kwargs = model._decoder_inputs(hidden, positions, None)
+        kwargs = _decoder_inputs(model, hidden, positions, None)
         for layer in model.model.layers:
             hidden = layer(hidden, **kwargs)
         targets = torch.nn.functional.pad(self.ids[:, 1:], (0, 1), value=-100)
         reference = model.mtp(hidden, self.ids, embedding=model.model.embed_tokens, head=model.lm_head,
-                              decoder_kwargs=[model._decoder_inputs(hidden[:, :-k], positions[:, k:], None)
+                              decoder_kwargs=[_decoder_inputs(model, hidden[:, :-k], positions[:, k:], None)
                                               for k in (1, 2)])
         reference_loss = compute_mtp_loss(reference.logits, targets)
         actual = model(self.ids, shift_labels=targets).loss

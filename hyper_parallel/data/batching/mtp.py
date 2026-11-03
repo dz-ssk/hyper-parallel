@@ -22,40 +22,9 @@ from __future__ import annotations
 from typing import Any
 
 import torch
-import torch.distributed as dist
-from torch.nn import functional as F
 
-from hyper_parallel.data.batching import TextParallelBatch
-from hyper_parallel.distributed.mtp import shift_mtp_tokens
-
-
-def prepare_mtp_inputs(input_ids: torch.Tensor, positions: torch.Tensor, targets: torch.Tensor,
-                       depth: int, *, cp_group: dist.ProcessGroup | None = None,
-                       attention_mask: torch.Tensor | None = None) -> dict[str, Any]:
-    """Align fixed-length MTP inputs before embedding and TP sequence scattering.
-
-    Sequences are contiguous CP shards of independent rows. Targets must already
-    be causal-next-token labels, including ignore_index at document boundaries.
-    """
-    shifted_targets = [shift_mtp_tokens(targets, k, group=cp_group, pad_value=-100)
-                       for k in range(1, depth + 1)]
-    if attention_mask is not None and attention_mask.ndim == 2:
-        rank = 0 if cp_group is None else dist.get_rank(cp_group)
-        start, length = rank * input_ids.shape[1], input_ids.shape[1]
-        valid = attention_mask[:, start:start + length].bool()
-        shifted_targets = [target.masked_fill(~valid, -100) for target in shifted_targets]
-    if attention_mask is not None and attention_mask.ndim == 4:
-        allowed = attention_mask if attention_mask.dtype == torch.bool else attention_mask.eq(0)
-        rank = 0 if cp_group is None else dist.get_rank(cp_group)
-        start, length = rank * input_ids.shape[1], input_ids.shape[1]
-        for k in range(1, depth + 1):
-            valid = F.pad(allowed[:, 0, k:, :].diagonal(dim1=-2, dim2=-1), (0, k))
-            shifted_targets[k - 1] = shifted_targets[k - 1].masked_fill(~valid[:, start:start + length], -100)
-    return {
-        "mtp_input_ids": tuple(shift_mtp_tokens(input_ids, k, group=cp_group) for k in range(1, depth + 1)),
-        "mtp_position_ids": tuple(shift_mtp_tokens(positions, k, group=cp_group) for k in range(1, depth + 1)),
-        "mtp_targets": tuple(shifted_targets),
-    }
+from hyper_parallel.data.batching.get_batch import TextParallelBatch
+from hyper_parallel.distributed.mtp import shift_mtp_tokens, prepare_mtp_inputs
 
 
 class MTPTextParallelBatch(TextParallelBatch):

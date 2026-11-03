@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Explicit stage partitioning for DeepSeek-V3 MTP pipeline schedules."""
+"""Explicit stage partitioning for public MTP pipeline schedules."""
 
 # Native Torch is required; the legacy platform-agnostic checker predates its removal.
 # pylint: disable=forbidden-backend-import
@@ -26,7 +26,6 @@ import torch
 from torch import nn
 
 from hyper_parallel.core.pipeline_parallel.stage import PipelineStage, SharedParameterInfo
-from hyper_parallel.models.deepseek_v3.adapter.mtp import DeepseekV3MTPForCausalLM
 
 
 class MTPPipelineModule(nn.Module):
@@ -38,7 +37,7 @@ class MTPPipelineModule(nn.Module):
     schedule accumulates microbatch gradients without averaging them.
     """
 
-    def __init__(self, model: DeepseekV3MTPForCausalLM, loss_scale: float = 1.0) -> None:
+    def __init__(self, model: nn.Module, loss_scale: float = 1.0) -> None:
         """Wrap a partitioned model; use 1 / microbatch_count for equal batches."""
         super().__init__()
         if not math.isfinite(loss_scale) or loss_scale <= 0:
@@ -62,7 +61,7 @@ class MTPPipelineModule(nn.Module):
         return sum(output.loss.values()) * self.loss_scale
 
 
-def partition_mtp_model(model: DeepseekV3MTPForCausalLM, stage_index: int,
+def partition_mtp_model(model: nn.Module, stage_index: int,
                         stage_count: int) -> list[SharedParameterInfo]:
     """Prune an unwrapped model to one PP stage before sharding and optimization.
 
@@ -74,34 +73,35 @@ def partition_mtp_model(model: DeepseekV3MTPForCausalLM, stage_index: int,
     the schedule must synchronize shared weights before forward and shared grads
     after all microbatch backwards, before the optimizer step.
     """
-    if not isinstance(model, DeepseekV3MTPForCausalLM) or model.mtp is None:
+    if getattr(model, "mtp", None) is None:
         raise ValueError("partition_mtp_model requires an enabled MTP model")
-    total = len(model.model.layers)
+    total = len(model.get_decoder().layers)
     if not 1 <= stage_count <= total or not 0 <= stage_index < stage_count:
         raise ValueError("PP stages must partition the trunk into nonempty consecutive layer ranges")
-    if not isinstance(model.model.layers, nn.ModuleList):
+    if not isinstance(model.get_decoder().layers, nn.ModuleList):
         raise ValueError("The model is already partitioned")
     quotient, remainder = divmod(total, stage_count)
     start = stage_index * quotient + min(stage_index, remainder)
     stop = start + quotient + int(stage_index < remainder)
-    model.model.layers = nn.ModuleDict({str(index): model.model.layers[index] for index in range(start, stop)})
+    model.get_decoder().layers = nn.ModuleDict(
+        {str(index): model.get_decoder().layers[index] for index in range(start, stop)})
     model.mtp_pipeline_first = stage_index == 0
     model.mtp_pipeline_last = stage_index == stage_count - 1
     shared = []
     if stage_count > 1 and (model.mtp_pipeline_first or model.mtp_pipeline_last):
-        embedding = model.model.embed_tokens
+        embedding = model.get_input_embeddings()
         shared.append(SharedParameterInfo(embedding.weight, [0, stage_count - 1],
                                            owner_module=embedding, param_name="weight"))
     if not model.mtp_pipeline_last:
         model.mtp = None
-        model.lm_head = None
-        model.model.norm = None
+        model.set_output_embeddings(None)
+        model.get_decoder().norm = None
     if not model.mtp_pipeline_first and not model.mtp_pipeline_last:
-        model.model.embed_tokens = None
+        model.set_input_embeddings(None)
     return shared
 
 
-def build_mtp_pipeline_stage(model: DeepseekV3MTPForCausalLM, *, stage_index: int,
+def build_mtp_pipeline_stage(model: nn.Module, *, stage_index: int,
                              stage_count: int, device: Any, mesh: Any = None,
                              loss_scale: float = 1.0) -> PipelineStage:
     """Build a PP-runtime stage for an explicit PipelineSchedule caller.

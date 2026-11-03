@@ -22,7 +22,7 @@ import os
 import torch
 import torch.distributed as dist
 from transformers import DeepseekV3Config
-from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3MoE
+from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3MoE, DeepseekV3ForCausalLM
 
 from hyper_parallel import SkipDTensorDispatch
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
@@ -33,11 +33,11 @@ from hyper_parallel.distributed.apply import apply_sharding_plan
 from hyper_parallel.distributed.expert_parallel.recipes import deepseekv3_ep_compute_fn
 from hyper_parallel.distributed.mesh import MeshContext
 from hyper_parallel.core.pipeline_parallel.scheduler import ScheduleGPipe
-from hyper_parallel.models.deepseek_v3.adapter.mtp_pipeline import build_mtp_pipeline_stage
+from hyper_parallel.distributed.mtp_pipeline import build_mtp_pipeline_stage
 from hyper_parallel.distributed.recipe_spec import ModuleShardingSpec
 from hyper_parallel.models.build_options import FSDP2Config, FSDP2MixedPrecisionConfig
 from hyper_parallel.models.deepseek_v3.adapter.distributed.context_parallel import mla_cp_wrapper
-from hyper_parallel.models.deepseek_v3.adapter.mtp import DeepseekV3MTPForCausalLM
+from hyper_parallel.components.modules.mtp_training import attach_mtp
 from hyper_parallel.trainer.config import Target
 from hyper_parallel.trainer.runtime.metrics import mean_global_loss
 from tests.common.mla_cp_utils import replace_and_load_mla
@@ -55,7 +55,7 @@ def _model() -> torch.nn.Module:
         mtp_loss_factor=0.3, mtp_loss_normalization="sequence",
     )
     config._attn_implementation = "sdpa"
-    model = DeepseekV3MTPForCausalLM(config).to(dtype=torch.bfloat16)
+    model = attach_mtp(DeepseekV3ForCausalLM(config), 2, mtp_boolean_mask=True).to(dtype=torch.bfloat16)
     return replace_and_load_mla(model, match=("*.self_attn",))[0]
 
 

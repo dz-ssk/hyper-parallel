@@ -1,241 +1,148 @@
-# Multi-token prediction (MTP)
+# 多 Token 预测（MTP）
 
-The public components supply the MTP fusion layer and teacher-forced loops.
-The DeepSeek-V3 model adapter additionally connects YAML construction, the text
-Trainer, per-depth token accounting, and distributed execution. Other model
-families supply their own decoder and metadata adapter. This is a training
-integration, not a speculative-generation engine.
+MTP 是公共建模能力。Trainer 调用公共模型构建入口时，根据 YAML 创建并挂载 MTP，
+不需要在 `models/deepseek_v3` 或其他模型目录中增加一个专用 MTP 模型类。
 
-## Reference and numerical contract
+## 构建顺序
 
-- Fusion follows the released-weight convention implemented by
-  [Transformers MtpLayer](https://github.com/huggingface/transformers/blob/0460c6d97702c7428460d83e53bcea6b76d110c0/src/transformers/modeling_layers.py):
-  `[enorm(embedding), hnorm(previous_hidden)]`, a bias-free `2H -> H` projection,
-  a Transformer block, then an independent output RMSNorm. The normalized output
-  feeds both the output head and the next depth. Default RMSNorm uses FP32
-  variance, casts normalized activations back, and then multiplies the weight,
-  matching the DeepSeek Transformers cast order.
-- The training loop follows the sequential, ground-truth-token construction in
-  [DeepSeek-V3 section 2.2](https://arxiv.org/html/2412.19437v2#S2.SS2).
-  It is not a port of the Transformers speculative-generation loop and does not
-  claim parity with DeepSeek's unpublished full training implementation.
-- For original length `S`, depth `k` (one-based) consumes embedding `input_ids[:, k:]`
-  and the first `S-k` prior states. It returns `S-k` predictions. No synthetic
-  padding token is fed through this variable-length entry point. All computation remains connected
-  to the main-model hidden states and shared parameters through autograd.
+```text
+YAML → Trainer → HyperAutoModelForCausalLM.from_config / from_pretrained
+     → 创建主干 → attach_mtp → build_mtp → 注册 model.mtp
+     → 模块替换 → 并行分片 → 重计算 → 权重加载或初始化 → 优化器
+```
 
-## MTP depth configuration
+MTP 必须在分片和优化器创建前注册。原模型类型、主干参数名称和共享权重保持不变；
+MTP 参数使用 `mtp.layers.*` 名称。公共训练入口同时连接前向、loss 和日志，
+不只是把一个未参与计算的模块挂到模型上。
 
-The name `mtp_num_layers` follows
-[Megatron-LM's MTP configuration](https://github.com/NVIDIA/Megatron-LM/blob/main/docs/user-guide/features/multi_token_prediction.md).
-Use a model-owned YAML argument, not a Trainer-wide training option:
+## YAML 配置
+
+完整的小模型配置片段见 [examples/mtp.yaml](../../examples/mtp.yaml)。
+补充数据源并替换生产模型维度后，可交给现有 Trainer 使用。
 
 ```yaml
 model:
-  _target_: my_model.build_model  # Your model adapter's builder
-  mtp_num_layers: 2
+  _target_: hyper_parallel.models.HyperAutoModelForCausalLM.from_config
+  mtp_num_layers: &mtp_depth 2
+  mtp_loss_factor: 0.3
+  mtp_loss_normalization: &mtp_norm sequence
+  config:
+    _target_: transformers.AutoConfig.for_model
+    model_type: llama
+    # 在这里配置模型结构；此示例仅展示入口。
+loss_fn:
+  _target_: hyper_parallel.components.losses.ModelOutputLoss
+dataloader:
+  get_batch:
+    _target_: hyper_parallel.data.batching.mtp.MTPTextParallelBatch
+    mtp_num_layers: *mtp_depth
+    mtp_loss_normalization: *mtp_norm
+    source_type: online
+    attention_mode: dense
+accelerator:
+  loss_parallel: false
 ```
 
-| Value | Behavior |
-|---|---|
-| Omitted / `null` (default), or `0` | Disable MTP; the factory returns `None` and constructs no layers |
-| Positive integer `D` | Construct `D` independent MTP layers and predict `D` additional future tokens |
+| 参数 | 含义 |
+| --- | --- |
+| `mtp_num_layers` | 额外的 MTP 层数，不计入主干 `num_hidden_layers`；0 关闭，正整数创建独立层 |
+| `mtp_loss_factor` | 所有深度的总系数，每层分配 `factor / D` |
+| `mtp_loss_normalization` | `sequence` 或 `valid_tokens`，见下文 |
+| `mtp_boolean_mask` | 默认 false，向 Decoder 传入加性 mask；使用要求 `True=允许` 的公共 attention 替换时设为 true |
 
-The public factory consumes the configured value. The model builder must accept
-and pass it through, attach the result before optimizer/sharding setup, and call
-it in forward/loss when enabled. This YAML fragment is for an adapter implementing
-that connection; adding the field to an arbitrary existing model does not enable
-MTP automatically. Negative, boolean and noninteger Python values are rejected.
+首次构建未配置层数时不开启 MTP。构建时的 MTP 配置会写回模型 config；从保存的 config
+恢复时自动重建，显式 `mtp_num_layers: 0` 可覆盖保存的层数。模型与 batch 端的层数和
+归一化需要一致，示例用 YAML anchor 共享。数据端负责各深度的 token 计数，避免梯度累加
+时把 LM 的有效 token 数错误地用于 MTP。
 
-## Ready-to-use DeepSeek-V3 training adapter
+## 复用模型结构的边界
 
-Merge [the MTP recipe](../../hyper_parallel/models/deepseek_v3/recipes/mtp.yaml)
-with a training configuration supplying the dataset and production dimensions.
-The builder target is `hyper_parallel.models.deepseek_v3.adapter.mtp.build_model`.
-Set `model.mtp_num_layers`, `model.mtp_loss_factor`, and
-`model.mtp_loss_normalization`. It creates and registers every MTP layer before
-sharding and optimizer construction. The depth is additional to
-`config.num_hidden_layers`, which counts the trunk only. The output head and
-embedding are shared with the trunk.
+公共接入通过结构接口工作，不根据模型名称分支。当前要求：
 
-Use `MTPTextParallelBatch` as `dataloader.get_batch` with the same depth and
-normalization (the recipe uses YAML anchors). It prepares future IDs, positions
-and labels and exposes independent per-depth token counts. Do not reuse the LM
-valid-token count for MTP: later depths have different valid targets. The
-standard Trainer globally normalizes each objective over DP/CP and gradient
-accumulation. `ModelOutputLoss` consumes the model's named loss mapping.
+- 模型提供 `get_decoder()`、`get_input_embeddings()`、`get_output_embeddings()` 和原生初始化方法。
+- Decoder 提供非空 `layers`、最终 `norm` 和 HF 风格 `rotary_emb`；每层接受位置、attention mask
+  和 rotary 元数据，返回 hidden tensor 或以 hidden 为第一项的 tuple。
+- 当前公共循环面向常规全因果 Decoder；自定义残差、多模态输入、滑窗/混合注意力等额外语义，
+  不能仅凭接口名称相同就视为已经适配。
 
-Logs include `foundation_loss/lm_loss`, `mtp_depth1_loss`, etc., the weighted
-aggregate `mtp_loss`, and the total `loss`. The aggregate is a detached metric;
-it is **not** added a second time to the backward objective. MTP checkpoints
-include registered layers in the normal model/optimizer state dictionaries.
-Depth zero preserves the native Hugging Face model and its inference behavior.
+默认用最后一个主干 Decoder 的**独立副本并重新初始化**构造每个 MTP 层，不共享主干层参数。
+外层融合和 Norm 使用公共 `MTPLayer`。需要其他 MTP block 结构的调用方，可以通过
+`attach_mtp(..., layer_factory=...)` 或 `build_mtp(..., layer_factory=...)` 提供自己的层工厂。
 
-### Distributed boundaries
+不带训练标签的普通推理仍调用原模型前向；没有实现 MTP speculative decoding 或 MTP KV cache。
 
-`forward_aligned` keeps local sequence lengths fixed, so each depth can use the
-same TP/SP and CP layout. `shift_mtp_tokens` exchanges only integer prefixes
-within an explicit CP group before embedding; it does not exchange full hidden
-states. It pads the end of the global row, never wraps to another row, and accepts
-an offset greater than a local shard. CP currently requires equal, contiguous,
-rank-ordered sequence shards. Dense boolean masks use `True = allowed`; additive
-masks use zero for allowed entries. Packed-document boundaries must be present
-in the dense attention mask and ignored targets. A compressed mask without
-boundary metadata is not an equivalent input contract.
+## 前向、loss 与日志
 
-- **TP/SP:** existing embedding, attention, FFN and head layouts apply to both
-  trunk and MTP. Fusion projections are replicated over hidden features and
-  preserve sequence ownership. Use `loss_parallel: false`: this adapter consumes
-  full-vocabulary logits, not vocabulary-parallel cross entropy.
-- **CP:** install the public MLA module replacement and `mla_cp_wrapper` on
-  `*.self_attn` / `*.self_attn.forward`, covering both trunk and MTP blocks.
-  A trunk-only `model.layers.*` rule leaves MTP attention unadapted.
-- **EP:** attach the public DeepSeek MoE compute recipe to every routed MoE
-  boundary, including `mtp.layers.*.mtp_block.mlp`. Dense FFNs must not receive
-  that recipe. Expert placement, routing and exchange use the existing EP path;
-  no fixed-router assumption is introduced.
-- **FSDP/HSDP and recomputation:** MTP layers participate in repeated-block
-  discovery. An MTP wrapper and its nested decoder must not both become separate
-  recomputation units. Apply the ordinary FSDP and activation-checkpoint settings.
-
-### Explicit pipeline schedules
-
-The ordinary monolithic `TextTrainer` builder does not partition pipeline stages.
-For PP, use `partition_mtp_model` before TP/CP/EP/FSDP wrapping, then wrap the
-partition in `MTPPipelineModule` and construct the framework's `PipelineStage`.
-For PP alone, `build_mtp_pipeline_stage` combines those operations.
-All helpers are in `hyper_parallel.models.deepseek_v3.adapter.mtp_pipeline`.
-
-Trunk layers are partitioned into nonempty consecutive ranges; all MTP layers,
-the final norm and output head reside on the last stage. First and last stages
-own embedding replicas declared through `SharedParameterInfo`, so the pipeline
-runtime broadcasts shared weights and sums shared gradients. These replicas are
-not independent parameters to optimize without synchronization.
-
-The stage's first positional tensor is input IDs on the first stage and received
-activations thereafter. Supply input IDs, labels and attention metadata as
-keyword arguments on every stage. `MTPPipelineModule` returns a scalar objective
-on the last stage, and exposes detached `last_loss_metrics` for logging. Set
-`loss_scale=1/microbatch_count` for equal-size microbatches; unequal valid-token
-counts require objective-specific weighting by the caller. A standalone PP
-partition retains original global layer indices for checkpointing; the optional
-stage wrapper introduces a `model.` prefix in its own state dictionary.
-
-## Model integration
-
-```python
-from hyper_parallel.components.modules import build_mtp, MTPLayer
-from hyper_parallel.components.losses import compute_mtp_loss
-
-# Inside build_model(..., mtp_num_layers=None), or the model constructor:
-# build_causal_decoder(k) belongs to the adapter and returns a fresh causal block.
-model.mtp = build_mtp(
-    mtp_num_layers,
-    layer_factory=lambda k: MTPLayer(hidden_size, build_causal_decoder(k)),
-)
-
-# In the model's forward/loss:
-total_loss = main_lm_loss
-if model.mtp is not None:
-    output = model.mtp(
-        trunk_hidden_before_final_norm,
-        input_ids,
-        embedding=model.embed_tokens,
-        head=lm_head,
-        decoder_kwargs=per_depth_attention_and_position_kwargs,
-    )
-    mtp_loss = compute_mtp_loss(
-        output.logits, next_token_labels, loss_factor=0.3,
-        normalization="sequence",
-    )
-    total_loss = total_loss + mtp_loss
-
-```
-
-`MultiTokenPrediction(layers)` also accepts an explicit list of independent layers.
-Each depth must have its own decoder and three independent norms. Embedding and
-head are supplied at forward time, so the component does not register duplicate
-copies. `head=None` returns hidden states only for a model-owned chunk-loss path.
-The factory's usual module initialization applies; matching an existing model's
-initialization distribution is the adapter's responsibility.
-
-The loop requires full, unsharded `[B, S]` rows and `S > mtp_num_layers`. It supports
-`B > 1`. Each decoder must be causal. Its kwargs at depth `k` must describe the
-shorter `S-k` sequence; the component cannot infer how to slice model-specific
-rotary embeddings, packed masks or cache metadata. With `decoder_kwargs=None`,
-the decoder must construct causal metadata itself. For CP/TP/SP integration, an
-adapter can call individual layers with correctly aligned tensors; no distributed
-layout or boundary exchange is implicitly performed by this training loop.
-
-## Labels, masks and normalization
-
-`next_token_labels` are already aligned main-LM targets, not unshifted input IDs:
+每层使用真实未来 token：
 
 ```text
-input_ids:              t0 t1 t2 t3
-next_token_labels:      t1 t2 t3 t4
-MTP depth 1 embeddings: t1 t2 t3
-MTP depth 1 targets:    t2 t3 t4
-MTP depth 2 embeddings: t2 t3
-MTP depth 2 targets:    t3 t4
+输入 token：      t0 t1 t2 t3
+主 LM 标签：      t1 t2 t3 t4
+MTP 第 1 层：     在原位置 i 融合 token i+1，预测 token i+2
+MTP 第 2 层：     在原位置 i 融合 token i+2，预测 token i+3
 ```
 
-If `t4` is unavailable, its label is `-100`. Apply binary supervision masks to the
-labels as `-100` before calling the loss. Arbitrary fractional token weighting
-and packed-document transition policies are not implemented by this helper.
+融合顺序是 `[enorm(embedding), hnorm(hidden)]`，之后执行无偏置 `2H → H` 投影、
+因果 Decoder 和输出 RMSNorm。各层的三个 Norm 独立，embedding 与输出头复用主干。
+主干 hidden 在最终 Norm 之前进入 MTP；每层的归一化输出传给下一深度。
 
-The helper consumes full-vocabulary logits and returns
-`loss_factor / D * sum(depth_loss)`:
+| 归一化 | 每层分母 | 说明 |
+| --- | --- | --- |
+| `sequence`（默认） | 原始 `B × S` | 包含无有效预测的尾部位置，对应原序列长度口径 |
+| `valid_tokens` | 本深度非忽略标签的数量 | 不同深度的有效目标数可能不同 |
 
-| Normalization | Denominator at each depth | Meaning |
-|---|---|---|
-| `sequence` (default) | `B*S` | Original-length denominator in paper Eq. 24 |
-| `valid_tokens` | Number of non-ignored targets at that depth | Masked-token mean |
+两种口径会改变梯度缩放，不应混用。CE 用 FP32 计算，无有效目标时产生可反传的零。
+Trainer 按各目标的计数处理 DP/CP 和梯度累加；主 LM 保持有效 token 均值。
 
-These are different objectives when target counts differ. Neither is labelled
-the universal industry training convention. An all-ignored depth contributes
-a differentiable zero. FP32 CE is used even for BF16 logits. Distributed/global
-micro-batch weighting must be handled by the model/Trainer adapter.
+日志包含 `foundation_loss/lm_loss`、`mtp_depth1_loss` 等分层 loss、聚合 `mtp_loss`
+和总 `loss`。聚合值是脱离计算图的日志项，**不会再次加进反向目标**。
 
-`compute_mtp_loss` consumes depth-aligned `[B, S-k, V]` logits and applies explicit
-normalization and depth weighting. The existing `calculate_mtp_loss` instead
-shifts every supplied logits tensor by one position, delegates reduction to its
-`loss_fn`, and sums the results without depth weighting. These are different input
-contracts, not interchangeable aliases; `calculate_mtp_loss` behavior and callers
-are unchanged.
+公共组件同时保留两种执行入口：
 
-## Fork adapter boundary
+- `forward`：处理完整序列，第 k 层长度为 `S-k`。
+- `forward_aligned`：处理已对齐的定长本地分片，保持 TP/SP/CP 的序列布局。
 
-Model-specific fusion order, dtype overrides, router behavior, private normalization and static-framework precision overrides do not belong in the public default.
-The public adapter owns its documented padding, packed-boundary and CP-shift contracts.
-A fork can supply its own fusion layer to `MultiTokenPrediction`, or use its own loop
-around public layers when its sequence contract differs.
+已有 `calculate_mtp_loss` 行为不变。新增 `compute_mtp_loss` 接收按深度对齐的 logits，
+并明确处理分母与深度系数；二者输入约定不同，不能直接替换。
 
-For an existing hidden-first checkpoint, changing only the concatenation order
-changes predictions. Swap the two `H`-wide column blocks of `eh_proj.weight` to
-preserve the linear map. Resume training also requires applying that permutation
-to the corresponding optimizer-state tensors. Do not swap enorm/hnorm parameters:
-they still normalize embedding/hidden respectively. Other checkpoint names must
-be mapped by the adapter; no whole-model checkpoint importer is provided here.
+## 并行与重计算
 
-## Validation scope
+- **TP/SP**：主干与 MTP block 复用已有并行机制。融合投影 `mtp.layers.*.eh_proj`
+  需要在 recipe 中声明为参数全复制，并保持输入输出的序列归属；不要把它当作普通列切分投影。
+  当前使用完整词表 CE，要求 `loss_parallel: false`。
+- **CP**：使用相同的 attention 并行 recipe，匹配范围必须覆盖 MTP block。
+  公共 `shift_mtp_tokens` 只交换整数元数据前缀，越过全局尾部补齐，不能回绕到另一条序列。
+  当前要求等长、连续且按 CP rank 排列的分片。
+- **EP**：已有 MoE recipe 同时覆盖主干与 MTP 的 MoE；不要将 MoE recipe 应用到 dense FFN。
+- **FSDP/HSDP、重计算**：MTP 层已注册，可被公共 repeated-block 发现机制识别；
+  避免 MTP 外层和内部 Decoder 被重复包装。
+- **Packed 输入**：使用 dense mask 和正确的忽略标签表达文档边界；缺少边界信息的 compressed
+  输入不满足本接入约定。
 
-CPU tests cover YAML depth selection, disabled MTP without layer allocation,
-factory/list numerical parity, causal multi-depth training, gradients through the shared
-embedding/head and trunk, depth target alignment, both normalization rules,
-ignored targets, BF16 loss, state-dict reload and the existing loss API.
-Real-model CPU tests also cover YAML construction, AdamW updates, model and
-optimizer checkpoint continuation, Trainer logging without double-counting,
-unequal microbatch token counts, padding, packed documents, and recomputation.
+### PP
 
-The NPU workers in `tests/torch/context_parallel/_test_mtp_parallel.py` compare
-complete LM/MTP losses and parameter gradients with an unsharded reference:
+公共接口位于 `hyper_parallel.distributed.mtp_pipeline`：
+`partition_mtp_model`、`MTPPipelineModule`、`build_mtp_pipeline_stage`。
 
-- Eight ranks: TP2 + CP2 + EP2, FSDP4, with SP/recomputation off and on;
-  an additional SP/recomputation case uses HSDP (two shards, two replicas).
-- Two ranks: an actual PP schedule, including P2P activation/gradient transfers
-  and shared-embedding synchronization.
+主干分到连续、非空的 stage，全部 MTP、最终 Norm 和输出头位于最后 stage。
+首尾 stage 的 embedding 声明为共享参数，由 PipelineStage 同步权重和梯度。
+先切 stage，再做该 stage 的 TP/CP/EP/FSDP 包装。
 
-These are short BF16 numerical parity tests, not long-run convergence results.
-PP combined with all other parallel dimensions has not been validated by these
-tests. The public component alone does not install a model's parallel recipes.
+PP 使用显式 schedule；普通 TextTrainer 不会仅因为设置 `pp_size` 就自动完成切分。
+等大小微批使用 `loss_scale=1/微批数`，有效 token 数不同时由调用方分别加权。
+PP 与其他并行维度同时组合不属于当前已验证范围。
+
+## 验证与私仓边界
+
+测试包括真实小模型的配置建层、前反向、AdamW 更新、模型与优化器状态恢复、日志、
+微批计数、文档边界及重计算。多卡测试将 LM/MTP loss 和完整参数梯度与无分片参考模型比较，
+另验证实际 PP 通信与共享 embedding 梯度同步。这些短程测试不代表生产规模长期收敛验收。
+
+相关代码：
+
+- `tests/ut/auto_models/test_mtp_training.py`
+- `tests/torch/context_parallel/_test_mtp_parallel.py`
+
+私仓 JT 的 hidden-first 拼接、路由和精度/归一化差异由私仓维护。
+迁移不同拼接顺序的 checkpoint 时，需要同步转换融合投影的权重列和对应优化器状态；
+本 PR 不提供私仓整网权重转换器。

@@ -44,6 +44,7 @@ from hyper_parallel.codegen.modeling_backend import ModelingBackend
 from hyper_parallel.models.build_options import get_device_id, get_device_type  # pylint: disable=syntax-error
 from hyper_parallel.models.build_options import CompileConfig
 from hyper_parallel.components.checkpoint.quantized_hf_storage import supports_hf_dequantization
+from hyper_parallel.components.modules.mtp_training import attach_mtp
 
 logger = logging.getLogger(__name__)
 
@@ -473,6 +474,10 @@ class _BaseHyperAutoModelClass:
         activation_swap: str = "none",
         model_init_dtype: Optional[Literal["float16", "bfloat16", "float32"]] = None,
         codegen_artifact_dir: Optional[str] = None,
+        mtp_num_layers: Optional[int] = None,
+        mtp_loss_factor: Optional[float] = None,
+        mtp_loss_normalization: Optional[str] = None,
+        mtp_boolean_mask: Optional[bool] = None,
         **kwargs,
     ) -> PreTrainedModel:
         """Core model building orchestration.
@@ -516,6 +521,18 @@ class _BaseHyperAutoModelClass:
                 backend=backend,
                 codegen_artifact_dir=codegen_artifact_dir,
                 **init_kwargs,
+            )
+            # Register extra trainable layers before replacement, placement,
+            # materialization and optimizer creation, preserving native FQNs.
+            attach_mtp(
+                model, mtp_num_layers if mtp_num_layers is not None else getattr(hf_config, "mtp_num_layers", None),
+                mtp_loss_factor=(mtp_loss_factor if mtp_loss_factor is not None
+                                 else getattr(hf_config, "mtp_loss_factor", 0.3)),
+                mtp_loss_normalization=(mtp_loss_normalization if mtp_loss_normalization is not None
+                                        else getattr(hf_config, "mtp_loss_normalization", "sequence")),
+                mtp_boolean_mask=(mtp_boolean_mask if mtp_boolean_mask is not None
+                                  else getattr(hf_config, "mtp_boolean_mask", False)),
+                mesh=mesh,
             )
 
         # Step 3-12: Apply infrastructure
