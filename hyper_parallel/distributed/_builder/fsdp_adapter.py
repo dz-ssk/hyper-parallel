@@ -248,7 +248,8 @@ class FSDP2Manager:
         for container_fqn, container in model.named_modules():
             if container_fqn and is_inside_declared_subtree(container_fqn):
                 continue
-            if id(container) in wrapped_module_ids:
+            if id(container) in wrapped_module_ids or any(
+                    container_fqn.startswith(block.fqn + ".") for block in wrap_modules):
                 continue
             if not hasattr(container, "gradient_checkpointing"):
                 continue

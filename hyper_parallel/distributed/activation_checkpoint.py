@@ -227,7 +227,8 @@ def _find_transformer_block_modules(
     for owner_fqn, owner in model.named_modules():
         # Match FSDP2's behavior for nested checkpointing owners: once an
         # owner has itself been selected as a block, do not scan inside it.
-        if id(owner) in discovered_block_ids:
+        if id(owner) in discovered_block_ids or any(
+                owner_fqn.startswith(block.fqn + ".") for block in block_infos):
             continue
         if not hasattr(owner, "gradient_checkpointing"):
             continue

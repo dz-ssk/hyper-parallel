@@ -757,6 +757,10 @@ class BaseTrainer(Stateful, ABC):
             device_mesh=self.mesh,
         )
         loss = torch.stack(list(loss_dict.values())).sum()
+        for name, members in (getattr(outputs, "loss_metric_groups", None) or {}).items():
+            if name in loss_dict or not members or any(member not in loss_dict for member in members):
+                raise ValueError(f"Invalid loss metric group {name!r}: {members!r}")
+            loss_dict[name] = torch.stack([loss_dict[member].detach() for member in members]).sum()
         # Model-declared extra metrics join the logged mapping only after
         # the backward loss is fixed: log-only, never part of the loss.
         extra_metrics = getattr(outputs, "extra_metrics", None)

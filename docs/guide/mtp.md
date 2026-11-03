@@ -1,9 +1,10 @@
 # Multi-token prediction (MTP)
 
-This component supplies the MTP fusion layer and a teacher-forced training loop.
-It is not a complete DeepSeek model or an automatic Trainer/generation plugin.
-The model adapter supplies the causal Transformer decoder, metadata and the
-main model's embedding and output head.
+The public components supply the MTP fusion layer and teacher-forced loops.
+The DeepSeek-V3 model adapter additionally connects YAML construction, the text
+Trainer, per-depth token accounting, and distributed execution. Other model
+families supply their own decoder and metadata adapter. This is a training
+integration, not a speculative-generation engine.
 
 ## Reference and numerical contract
 
@@ -20,7 +21,7 @@ main model's embedding and output head.
   claim parity with DeepSeek's unpublished full training implementation.
 - For original length `S`, depth `k` (one-based) consumes embedding `input_ids[:, k:]`
   and the first `S-k` prior states. It returns `S-k` predictions. No synthetic
-  padding token is fed through the decoder. All computation remains connected
+  padding token is fed through this variable-length entry point. All computation remains connected
   to the main-model hidden states and shared parameters through autograd.
 
 ## MTP depth configuration
@@ -45,6 +46,80 @@ and pass it through, attach the result before optimizer/sharding setup, and call
 it in forward/loss when enabled. This YAML fragment is for an adapter implementing
 that connection; adding the field to an arbitrary existing model does not enable
 MTP automatically. Negative, boolean and noninteger Python values are rejected.
+
+## Ready-to-use DeepSeek-V3 training adapter
+
+Merge [the MTP recipe](../../hyper_parallel/models/deepseek_v3/recipes/mtp.yaml)
+with a training configuration supplying the dataset and production dimensions.
+The builder target is `hyper_parallel.models.deepseek_v3.adapter.mtp.build_model`.
+Set `model.mtp_num_layers`, `model.mtp_loss_factor`, and
+`model.mtp_loss_normalization`. It creates and registers every MTP layer before
+sharding and optimizer construction. The depth is additional to
+`config.num_hidden_layers`, which counts the trunk only. The output head and
+embedding are shared with the trunk.
+
+Use `MTPTextParallelBatch` as `dataloader.get_batch` with the same depth and
+normalization (the recipe uses YAML anchors). It prepares future IDs, positions
+and labels and exposes independent per-depth token counts. Do not reuse the LM
+valid-token count for MTP: later depths have different valid targets. The
+standard Trainer globally normalizes each objective over DP/CP and gradient
+accumulation. `ModelOutputLoss` consumes the model's named loss mapping.
+
+Logs include `foundation_loss/lm_loss`, `mtp_depth1_loss`, etc., the weighted
+aggregate `mtp_loss`, and the total `loss`. The aggregate is a detached metric;
+it is **not** added a second time to the backward objective. MTP checkpoints
+include registered layers in the normal model/optimizer state dictionaries.
+Depth zero preserves the native Hugging Face model and its inference behavior.
+
+### Distributed boundaries
+
+`forward_aligned` keeps local sequence lengths fixed, so each depth can use the
+same TP/SP and CP layout. `shift_mtp_tokens` exchanges only integer prefixes
+within an explicit CP group before embedding; it does not exchange full hidden
+states. It pads the end of the global row, never wraps to another row, and accepts
+an offset greater than a local shard. CP currently requires equal, contiguous,
+rank-ordered sequence shards. Dense boolean masks use `True = allowed`; additive
+masks use zero for allowed entries. Packed-document boundaries must be present
+in the dense attention mask and ignored targets. A compressed mask without
+boundary metadata is not an equivalent input contract.
+
+- **TP/SP:** existing embedding, attention, FFN and head layouts apply to both
+  trunk and MTP. Fusion projections are replicated over hidden features and
+  preserve sequence ownership. Use `loss_parallel: false`: this adapter consumes
+  full-vocabulary logits, not vocabulary-parallel cross entropy.
+- **CP:** install the public MLA module replacement and `mla_cp_wrapper` on
+  `*.self_attn` / `*.self_attn.forward`, covering both trunk and MTP blocks.
+  A trunk-only `model.layers.*` rule leaves MTP attention unadapted.
+- **EP:** attach the public DeepSeek MoE compute recipe to every routed MoE
+  boundary, including `mtp.layers.*.mtp_block.mlp`. Dense FFNs must not receive
+  that recipe. Expert placement, routing and exchange use the existing EP path;
+  no fixed-router assumption is introduced.
+- **FSDP/HSDP and recomputation:** MTP layers participate in repeated-block
+  discovery. An MTP wrapper and its nested decoder must not both become separate
+  recomputation units. Apply the ordinary FSDP and activation-checkpoint settings.
+
+### Explicit pipeline schedules
+
+The ordinary monolithic `TextTrainer` builder does not partition pipeline stages.
+For PP, use `partition_mtp_model` before TP/CP/EP/FSDP wrapping, then wrap the
+partition in `MTPPipelineModule` and construct the framework's `PipelineStage`.
+For PP alone, `build_mtp_pipeline_stage` combines those operations.
+All helpers are in `hyper_parallel.models.deepseek_v3.adapter.mtp_pipeline`.
+
+Trunk layers are partitioned into nonempty consecutive ranges; all MTP layers,
+the final norm and output head reside on the last stage. First and last stages
+own embedding replicas declared through `SharedParameterInfo`, so the pipeline
+runtime broadcasts shared weights and sums shared gradients. These replicas are
+not independent parameters to optimize without synchronization.
+
+The stage's first positional tensor is input IDs on the first stage and received
+activations thereafter. Supply input IDs, labels and attention metadata as
+keyword arguments on every stage. `MTPPipelineModule` returns a scalar objective
+on the last stage, and exposes detached `last_loss_metrics` for logging. Set
+`loss_scale=1/microbatch_count` for equal-size microbatches; unequal valid-token
+counts require objective-specific weighting by the caller. A standalone PP
+partition retains original global layer indices for checkpointing; the optional
+stage wrapper introduces a `model.` prefix in its own state dictionary.
 
 ## Model integration
 
@@ -131,8 +206,8 @@ are unchanged.
 
 ## Fork adapter boundary
 
-Model-specific fusion order, dtype overrides, router behavior, fixed-length
-padding, packed boundaries and CP shifts do not belong in the public default.
+Model-specific fusion order, dtype overrides, router behavior, private normalization and static-framework precision overrides do not belong in the public default.
+The public adapter owns its documented padding, packed-boundary and CP-shift contracts.
 A fork can supply its own fusion layer to `MultiTokenPrediction`, or use its own loop
 around public layers when its sequence contract differs.
 
@@ -149,4 +224,18 @@ CPU tests cover YAML depth selection, disabled MTP without layer allocation,
 factory/list numerical parity, causal multi-depth training, gradients through the shared
 embedding/head and trunk, depth target alignment, both normalization rules,
 ignored targets, BF16 loss, state-dict reload and the existing loss API.
-These tests do not certify full-model convergence or distributed/NPU precision.
+Real-model CPU tests also cover YAML construction, AdamW updates, model and
+optimizer checkpoint continuation, Trainer logging without double-counting,
+unequal microbatch token counts, padding, packed documents, and recomputation.
+
+The NPU workers in `tests/torch/context_parallel/_test_mtp_parallel.py` compare
+complete LM/MTP losses and parameter gradients with an unsharded reference:
+
+- Eight ranks: TP2 + CP2 + EP2, FSDP4, with SP/recomputation off and on;
+  an additional SP/recomputation case uses HSDP (two shards, two replicas).
+- Two ranks: an actual PP schedule, including P2P activation/gradient transfers
+  and shared-embedding synchronization.
+
+These are short BF16 numerical parity tests, not long-run convergence results.
+PP combined with all other parallel dimensions has not been validated by these
+tests. The public component alone does not install a model's parallel recipes.

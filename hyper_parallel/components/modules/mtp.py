@@ -95,7 +95,7 @@ class MTPLayer(nn.Module):
 
 @dataclass
 class MTPOutput:
-    """Depth k (one-based) has S-k positions; logits are empty if head is None."""
+    """Per-depth hidden states and optional logits; aligned inputs preserve sequence length."""
 
     hidden_states: tuple[torch.Tensor, ...]
     logits: tuple[torch.Tensor, ...]
@@ -110,10 +110,10 @@ class MultiTokenPrediction(nn.Module):
             adapters may supply another layer with the same contract.
 
     Note:
-        This loop consumes complete, unsharded rows. It does not implement CP halo
-        exchange, packed-document boundaries, generation/KV caching or automatic
-        Trainer integration. Those belong to the model adapter. A distributed
-        adapter may also call individual layers with already-aligned inputs.
+        forward consumes complete, unsharded rows. forward_aligned preserves
+        the local shape for distributed adapters supplying future embeddings
+        and depth-specific metadata. CP exchange, packed boundaries and loss
+        accounting belong to the model adapter; neither entry implements decoding caches.
     """
 
     def __init__(self, layers: Sequence[nn.Module]) -> None:
@@ -122,6 +122,8 @@ class MultiTokenPrediction(nn.Module):
         if not layers:
             raise ValueError("MTP requires at least one prediction layer")
         self.layers = nn.ModuleList(layers)
+        # The generic FSDP and activation-checkpoint discovery uses this marker.
+        self.gradient_checkpointing = False
 
     def forward(self, hidden_states: torch.Tensor, input_ids: torch.Tensor, *,
                 embedding: nn.Module, head: nn.Module | None = None,
@@ -152,6 +154,40 @@ class MultiTokenPrediction(nn.Module):
             kwargs = {} if decoder_kwargs is None else decoder_kwargs[index]
             future_embeddings = embedding(input_ids[:, index + 1:])
             hidden_states = layer(hidden_states[:, :-1], future_embeddings, **kwargs)
+            states.append(hidden_states)
+            if head is not None:
+                logits.append(head(hidden_states))
+        return MTPOutput(tuple(states), tuple(logits))
+
+    def forward_aligned(
+        self, hidden_states: torch.Tensor, future_embeddings: Sequence[torch.Tensor], *,
+        head: nn.Module | None = None,
+        decoder_kwargs: Sequence[Mapping[str, Any]] | None = None,
+    ) -> MTPOutput:
+        """Run fixed-length, already aligned local shards without slicing them.
+
+        Args:
+            hidden_states: Local trunk activations; sequence/hidden layout is
+                owned by the model's parallel boundaries.
+            future_embeddings: One aligned embedding tensor per depth, with the
+                same local shape as hidden_states. Shift tokens before embedding
+                and TP sequence scattering. CP adapters exchange token halos;
+                invalid tail targets must be ignored by the loss.
+            head: Shared output projection, including its TP boundary if enabled.
+            decoder_kwargs: Local positions and attention metadata per depth.
+
+        Returns:
+            Local per-depth states and optional logits. The method retains the
+            input shape, so TP/SP/CP divisibility is preserved at every depth.
+        """
+        if len(future_embeddings) != len(self.layers):
+            raise ValueError("future_embeddings must contain one tensor per MTP depth")
+        if decoder_kwargs is not None and len(decoder_kwargs) != len(self.layers):
+            raise ValueError("decoder_kwargs must contain one mapping per MTP depth")
+        states, logits = [], []
+        for index, layer in enumerate(self.layers):
+            kwargs = {} if decoder_kwargs is None else decoder_kwargs[index]
+            hidden_states = layer(hidden_states, future_embeddings[index], **kwargs)
             states.append(hidden_states)
             if head is not None:
                 logits.append(head(hidden_states))
