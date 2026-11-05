@@ -111,7 +111,7 @@ class TrainerConfig:
 
     def _validate_loss_normalization(self) -> None:
         """Reject unsupported objectives before building the model or Trainer."""
-        if self.training.loss_normalization == "legacy":
+        if self.training.loss_normalization != "microbatch":
             return
         for path, options in (("model", self.model), ("model.config", getattr(self.model, "config", None))):
             for name in ("mtp_num_layers", "moe_aux_loss_coeff", "router_aux_loss_coef", "router_aux_loss_coeff"):
@@ -119,7 +119,7 @@ class TrainerConfig:
                 if value is not None and value > 0:
                     raise ValueError(
                         f"training.loss_normalization={self.training.loss_normalization!r} only supports main LM loss; "
-                        f"{path}.{name}={value} enables MTP or auxiliary loss. Disable it or use 'legacy'."
+                        f"{path}.{name}={value} enables MTP or auxiliary loss. Use 'legacy' or 'token'."
                     )
 
     def to_dict(self) -> dict[str, Any]:
