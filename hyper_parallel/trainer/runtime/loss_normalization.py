@@ -36,15 +36,19 @@ class StepLossNormalization:
     """Normalize local mean losses without retaining micro-batch inputs.
 
     Counts describe CP-local targets and are replicated across TP ranks, as in
-    TextParallelBatch. Both modes accept only the main LM loss, as a scalar or
-    ``foundation_loss``. Models must not fold MTP or auxiliary objectives into
-    that scalar; their independent normalization is not supported.
+    TextParallelBatch. Token mode accepts losses sharing one token-count family
+    and external weight, including separately averaged LM/MTP branches. Injected
+    auxiliary losses must follow the public auxiliary-loss scaling context.
+    Microbatch mode accepts only the main LM loss; it does not normalize MTP or
+    auxiliary objectives.
     """
 
     def __init__(self, mode: str, micro_steps: int, mesh: MeshContext) -> None:
         """Create fresh scalar accounting for one optimizer step."""
         if mode not in ("microbatch", "token"):
             raise ValueError("loss_normalization must be 'microbatch' or 'token'")
+        if mesh.sequence_parallel:
+            raise ValueError("microbatch/token normalization requires TP-replicated token counts")
         self.mode = mode
         self.micro_steps = micro_steps
         self.mesh = mesh
@@ -57,19 +61,25 @@ class StepLossNormalization:
         """Return global reporting values with locally weighted backward edges.
 
         Args:
-            losses: CP-local main LM mean, optionally keyed by ``foundation_loss``.
+            losses: Mean objectives with the same external token weight in token mode.
             counts: Effective local target counts keyed by ``<family>_tokens``.
         """
         if isinstance(losses, torch.Tensor):
             losses = {"foundation_loss": losses}
-        if set(losses) != {"foundation_loss"}:
+        if self.mode == "microbatch" and set(losses) != {"foundation_loss"}:
             raise ValueError(
-                "microbatch/token normalization supports only foundation_loss (main LM loss); "
-                "MTP and auxiliary losses are not supported. Use legacy for existing model-specific objectives."
+                "microbatch normalization supports only foundation_loss (main LM loss); "
+                "use legacy or token for MTP and auxiliary objectives."
             )
         if self.mode == "token":
-            loss_device = losses["foundation_loss"].device
-            count = counts["foundation_tokens"].detach().to(loss_device)
+            families = {key.split("_loss", maxsplit=1)[0] for key in losses}
+            if len(families) != 1:
+                raise ValueError("Token normalization requires losses sharing one token-count family")
+            if self.loss_names and self.loss_names != set(losses):
+                raise ValueError("Token normalization requires the same loss keys throughout an optimizer step")
+            family = next(iter(families))
+            loss_device = next(iter(losses.values())).device
+            count = counts[f"{family}_tokens"].detach().to(loss_device)
             self.token_count = count if self.token_count is None else self.token_count + count
             self.loss_names.update(losses)
 
